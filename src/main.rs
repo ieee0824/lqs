@@ -1,48 +1,22 @@
-use lqs::{Lqs, QueueOptions, QueueType, SendRequest};
+use lqs::{ServerConfig, serve};
 
-fn main() {
-    let mut lqs = Lqs::new();
-    lqs.create_queue(
-        "orders.fifo",
-        QueueType::Fifo,
-        QueueOptions {
-            content_based_deduplication: true,
-            ..QueueOptions::default()
-        },
-    )
-    .expect("valid demo queue");
+#[tokio::main]
+async fn main() {
+    let config = match ServerConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("invalid server configuration: {error}");
+            std::process::exit(2);
+        }
+    };
 
-    lqs.send(
-        "orders.fifo",
-        SendRequest::fifo("order-A: created", "order-A"),
-        0,
-    )
-    .unwrap();
-    lqs.send(
-        "orders.fifo",
-        SendRequest::fifo("order-A: paid", "order-A"),
-        1,
-    )
-    .unwrap();
-    lqs.send(
-        "orders.fifo",
-        SendRequest::fifo("order-B: created", "order-B"),
-        2,
-    )
-    .unwrap();
-
-    let batch = lqs.receive("orders.fifo", 10, 3).unwrap();
-    for message in &batch {
-        println!(
-            "{} [{}]",
-            message.body,
-            message.message_group_id.as_deref().unwrap_or("standard")
-        );
-    }
-    // Deleting order-A's first event makes its next event eligible for delivery.
-    lqs.delete("orders.fifo", &batch[0].receipt_handle).unwrap();
     println!(
-        "next: {}",
-        lqs.receive("orders.fifo", 1, 4).unwrap()[0].body
+        "LQS listening on {} (database: {})",
+        config.bind_addr,
+        config.database_path.display()
     );
+    if let Err(error) = serve(config).await {
+        eprintln!("LQS server failed: {error}");
+        std::process::exit(1);
+    }
 }
