@@ -158,7 +158,7 @@ JSON / Queryの両方で`ListQueues`、`GetQueueUrl`、`DeleteQueue`、`PurgeQue
 | `FifoQueue` | FIFOは`true`、Standardは`false` |
 | `CreatedTimestamp` / `LastModifiedTimestamp` | 作成・設定更新のUnix秒 |
 
-メトリクスは保持期限切れを除いたSQLite上の即時集計です。AWSの非同期な近似更新は再現しません。旧DBで不明な作成・更新日時は0です。`SetQueueAttributes.VisibilityTimeout`は0〜43,200秒（既定30秒）で、受信済みの可視性期限は変更せず、次回の受信から適用します。設定変更とタグは再起動後も維持されます。IAMポリシー、KMS暗号化、RedriveAllowPolicy等の未対応設定はエラーにします。
+メトリクスは保持期限切れを除いたSQLite上の即時集計です。AWSの非同期な近似更新は再現しません。旧DBで不明な作成・更新日時は0です。`SetQueueAttributes.VisibilityTimeout`は0〜43,200秒（既定30秒）で、受信済みの可視性期限は変更せず、次回の受信から適用します。設定変更とタグは再起動後も維持されます。ポリシー・SSE/KMSの設定モデルは下記の範囲で対応し、RedriveAllowPolicy等の未対応設定はエラーにします。
 
 タグはキー1〜128文字・値0〜256文字のUnicode文字列です。Unicode英数字・空白と`_ . : / = + - @`を使え、`aws:`プレフィックスは使用できません。LQSの上限は1キュー50タグです（AWSでは50以下が推奨）。同名キーは上書き、存在しないキーの削除は成功し、不正な更新は全体を巻き戻します。`CreateQueue`の`tags`にも対応します。同名・同設定での再作成は既存タグを変更しないため、更新には`TagQueue`を使ってください。Query形式は`Tag.N.Key` / `Tag.N.Value`、`TagKey.N`です。
 
@@ -173,6 +173,41 @@ Rustでは`list_queues`、`queue_exists`、`queue_metrics`、`tag_queue`、`unta
 
 仕様参考: [ListQueues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ListQueues.html)、[PurgeQueue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_PurgeQueue.html)、[DeleteQueue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteQueue.html)、[タグ制約](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-queues.html)。
 
+## アクセスポリシー・暗号化設定のシミュレーション
+
+これはローカル開発用の認可・構成シミュレーションです。**AWS認証や実データ暗号化を提供するものではありません。インターネットや信頼できないクライアントへ公開しないでください。**
+
+### ポリシーと権限
+
+`CreateQueue` / `SetQueueAttributes` / `GetQueueAttributes`の`Policy`に、JSON文字列のキューポリシーを指定できます。SQLiteへ永続化し、更新時刻も記録します。ポリシーが存在するキューでは明示的Allowが必要で、どれか一つでも一致するDenyがあれば403 `AccessDenied`を返します。Send/Receive/Deleteと対応するバッチ、可視性変更、キュー管理、権限・属性変更を同じように検査します。ロングポーリングとFIFO受信再試行も各処理前に最新ポリシーを確認します。
+
+- 対応要素: `Version`（2012-10-17 / 2008-10-17）、任意の`Id`、`Statement`（オブジェクトまたは配列）、`Sid`、`Effect`、`Principal`、`Action`、`Resource`。
+- Principal: `"*"`、または`{"AWS": "12桁アカウントIDまたはIAM user/role/root ARN"}`。AWS値は配列も可能です。account/rootはそのアカウントのuser/roleにも一致します。Service/STS/フェデレーションのPrincipalは未対応です。
+- Action: `sqs:SendMessage`等、`sqs:*`や`*`/`?`パターン。Actionの一致は大文字小文字を区別せず、ResourceのSQS ARNは区別します。バッチ操作の権限は対応する単体操作へ対応付けます。
+- 上限: 8 KiB、20 Statement、合計50 Principal、各Statement 7 Action。`Condition`、`NotAction`、`NotResource`、`NotPrincipal`など未対応要素は、無視せず設定時に拒否します。IAM identity policy、SCP、permission boundary、ABAC、クロスアカウント二重認可は評価しません。
+
+`AddPermission`は`Label`をSidとするAllow文を既存ポリシーへ追加し、`RemovePermission`は該当Sidだけを除きます。既存のDenyや他の文は維持します。Labelは1〜80文字の英数字・`-`・`_`、AWSAccountIdsは12桁のアカウント番号、Actionsは`SendMessage`等の操作名または`*`です。重複Labelはエラー、存在しないLabelの削除は成功します。最後の文を削除しても空のポリシーを保持し、暗黙の拒否は解除しません。
+
+互換性のため、**Policy未設定のキューはローカル開放モード**です。`Policy=""`で削除すると再び開放されます。所有者への暗黙の権限付与はしないため、設定前に管理用Principalへ`SetQueueAttributes` / `AddPermission` / `RemovePermission`等の権限を含めてください。最初のAddPermissionだけで管理権限がなくなる場合もあります。自分を拒否するポリシーを設定するとHTTPから戻せなくなるため、信頼されたRust管理コードから設定を復旧してください。Rustの`Lqs`直接操作は管理用で、HTTP認可を自動適用しません。
+
+### 呼び出し元の識別・認可フック
+
+既定では全HTTPリクエストをAnonymousとして評価し、`x-lqs-principal`を受け付けません。AWS SDKのSigV4ヘッダーは署名検証せず、そこからアカウントや権限を推定することもありません。
+
+ローカルの権限テストに限り、`LQS_TRUST_PRINCIPAL_HEADER=true`で起動すると`x-lqs-principal`にアカウントIDまたはIAM ARNを指定できます。**これはクライアントの自己申告で、誰でもなりすませます。認証ではありません。** ヘッダー省略時はAnonymousです。
+
+埋め込み用途では`router_with_authorization(lqs, base_url, Arc<AuthorizationHook>)`を利用します。フックはメソッド・URI・ヘッダー・元のbody・action・queue名を受け取り、検証済みの`RequestIdentity`か`LqsError::AccessDenied`を返します。フックは同期・非ブロッキングで実装してください。戻されたidentityでもキューポリシーを回避できません。新規CreateQueueとListQueuesは対象キューポリシーがないため、このフックでグローバルな許可を制御します。既定では新規作成・一覧は開放されます。署名検証、TLS、認証情報の管理、監査イベント記録は利用側の責任です。設定は取得できますがCloudTrail相当の監査ログは実装していません。
+
+同じサーバー内のポリシー確認と各操作は同じDB Mutex内で行います。DBファイルへ直接書けるプロセスや別の組み込み`Lqs`接続は信頼された管理者として扱います。SQLiteファイルのアクセス権や、複数プロセス間の認可境界をこのフックで保護するものではありません。
+
+### SSE-SQS / KMS構成モデル
+
+`SqsManagedSseEnabled`（既定false）、`KmsMasterKeyId`、`KmsDataKeyReusePeriodSeconds`（60〜86,400秒、既定300）をCreate/Set/Getで保持します。SSE-SQSとKMSを同時に有効化できません。KMSキー指定はSSE-SQSを無効化し、SSE-SQSの有効化はKMSキーを解除します。空のKmsMasterKeyIdはKMSを解除します。キーは識別子として保存するだけで、実在性・キーへの権限は確認しません。
+
+**メッセージ本文・属性・FIFO受信キャッシュ・SQLite/WAL/バックアップはすべて平文のままです。** 暗号化・復号、AWS KMS呼び出し、データキー生成/キャッシュ/ローテーションは行いません。キュー属性の`SqsManagedSseEnabled=true`は要求された構成を示すだけです。実暗号化を誤認させないため、受信メッセージのシステム属性`SqsManagedSseEnabled`はfalseのままです。ポリシーと暗号化設定はPurgeで維持し、DeleteQueueで削除します。
+
+仕様参考: [SQSの操作と権限対応](https://docs.aws.amazon.com/service-authorization/latest/reference/list_sqs.html)、[AddPermission](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_AddPermission.html)、[SetQueueAttributes](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html)。
+
 ## テスト
 
 Rustの単体テストと、実際のHTTPサーバーへAWS SDK for Go v2で接続する結合テストがあります。
@@ -180,7 +215,8 @@ Rustの単体テストと、実際のHTTPサーバーへAWS SDK for Go v2で接�
 ```bash
 cargo test
 
-# 別ターミナルで cargo run を実行してから
+# 別ターミナルでテスト専用モードを起動:
+# LQS_TRUST_PRINCIPAL_HEADER=true cargo run
 cd integration
 LQS_ENDPOINT=http://127.0.0.1:9324 go test -v ./...
 ```

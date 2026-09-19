@@ -3,8 +3,16 @@ use std::path::Path;
 
 use crate::message_attributes::validate_message_attributes;
 use crate::{MessageAttributes, message_attributes_md5, message_attributes_size};
+use crate::{QueueSecurity, RequestIdentity, SecurityUpdate};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+
+#[path = "security_sqlite.rs"]
+mod security_sqlite;
+
+#[cfg(test)]
+#[path = "security_tests.rs"]
+mod security_tests;
 
 #[path = "fifo.rs"]
 mod fifo;
@@ -72,6 +80,7 @@ impl QueueType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueOptions {
+    pub security: QueueSecurity,
     pub deduplication_scope: DeduplicationScope,
     pub fifo_throughput_limit: FifoThroughputLimit,
     pub visibility_timeout_ms: u64,
@@ -89,6 +98,7 @@ pub struct QueueOptions {
 /// Partial update: None preserves the current setting.
 #[derive(Debug, Clone, Default)]
 pub struct QueueUpdate {
+    pub security: SecurityUpdate,
     pub visibility_timeout_ms: Option<u64>,
     pub content_based_deduplication: Option<bool>,
     pub deduplication_scope: Option<DeduplicationScope>,
@@ -111,6 +121,7 @@ pub struct RedrivePolicy {
 impl Default for QueueOptions {
     fn default() -> Self {
         Self {
+            security: QueueSecurity::default(),
             deduplication_scope: DeduplicationScope::Queue,
             fifo_throughput_limit: FifoThroughputLimit::PerQueue,
             visibility_timeout_ms: 30_000,
@@ -177,6 +188,8 @@ pub struct ReceivedMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LqsError {
+    AccessDenied,
+    InvalidSecuritySettings(String),
     PurgeQueueInProgress,
     QueueDeletedRecently,
     InvalidQueueManagement(String),
@@ -204,6 +217,10 @@ pub enum LqsError {
 impl fmt::Display for LqsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AccessDenied => write!(f, "access denied"),
+            Self::InvalidSecuritySettings(message) => {
+                write!(f, "invalid security settings: {message}")
+            }
             Self::PurgeQueueInProgress => {
                 write!(f, "PurgeQueue was called within the last 60 seconds")
             }
@@ -396,6 +413,7 @@ impl Lqs {
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_inflight ON messages(queue_name, invisible_until_ms)")?;
         fifo::migrate(&transaction)?;
         management::migrate(&transaction)?;
+        security_sqlite::migrate(&transaction)?;
         if transaction
             .prepare("PRAGMA foreign_key_check")?
             .exists([])?
@@ -433,6 +451,7 @@ impl Lqs {
         now_ms: u64,
     ) -> Result<(), LqsError> {
         let name = name.into();
+        options.security.validate()?;
         management::validate_tags(&tags)?;
         if queue_type == QueueType::Fifo && !name.ends_with(".fifo") {
             return Err(LqsError::InvalidFifoName(name));
@@ -481,6 +500,7 @@ impl Lqs {
         );
         match result {
             Ok(_) => {
+                security_sqlite::write(&transaction, &name, &options.security)?;
                 transaction.execute(
                     "UPDATE queues SET created_at_ms = ?2, modified_at_ms = ?2 WHERE name = ?1",
                     params![name, ms(now_ms)],
@@ -894,6 +914,8 @@ impl Lqs {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = read_queue_config(&transaction, name)?;
+        let security = current.security.updated(&update.security)?;
+        security_sqlite::write(&transaction, name, &security)?;
         let visibility = update
             .visibility_timeout_ms
             .unwrap_or(current.visibility_timeout_ms);
@@ -957,6 +979,7 @@ fn read_queue_config(connection: &Connection, queue_name: &str) -> Result<QueueC
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, u64>(4)?, row.get::<_, u64>(5)?, row.get::<_, usize>(6)?, row.get::<_, u64>(7)?, row.get::<_, usize>(8)?)),
         ).optional()?.ok_or_else(|| LqsError::QueueNotFound(queue_name.to_owned()))?;
     Ok(QueueConfig {
+        security: security_sqlite::read(connection, queue_name)?,
         deduplication_scope: connection
             .query_row(
                 "SELECT deduplication_scope FROM queues WHERE name = ?1",
@@ -991,6 +1014,7 @@ impl Default for Lqs {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QueueConfig {
+    pub(crate) security: QueueSecurity,
     pub(crate) deduplication_scope: DeduplicationScope,
     pub(crate) fifo_throughput_limit: FifoThroughputLimit,
     pub(crate) queue_type: QueueType,

@@ -13,6 +13,10 @@ pub(super) fn validate_attribute_names(
     for name in attributes.keys() {
         if !([
             "VisibilityTimeout",
+            "Policy",
+            "SqsManagedSseEnabled",
+            "KmsMasterKeyId",
+            "KmsDataKeyReusePeriodSeconds",
             "DelaySeconds",
             "MessageRetentionPeriod",
             "MaximumMessageSize",

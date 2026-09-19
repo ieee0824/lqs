@@ -38,6 +38,7 @@ jobs:
           LQS_BASE_URL: http://127.0.0.1:9324
           LQS_DATABASE_PATH: ${{ runner.temp }}/lqs.sqlite
           LQS_ENDPOINT: http://127.0.0.1:9324
+          LQS_TRUST_PRINCIPAL_HEADER: 'true'
         run: |
           set -euo pipefail
           target/debug/lqs >"${RUNNER_TEMP}/lqs.log" 2>&1 &
