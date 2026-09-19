@@ -18,9 +18,12 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use crate::{
-    Lqs, LqsError, QueueOptions, QueueType, QueueUpdate, ReceivedMessage, RedrivePolicy,
-    SendRequest, SendResult,
+    BatchResult, Lqs, LqsError, QueueOptions, QueueType, QueueUpdate, ReceivedMessage,
+    RedrivePolicy, SendRequest, SendResult,
 };
+
+#[path = "batch_http.rs"]
+mod batch_http;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:9324";
 const DEFAULT_DATABASE_PATH: &str = "lqs.sqlite";
@@ -267,6 +270,16 @@ impl WireRequest {
             .ok_or_else(|| ApiError::missing(name))
     }
 
+    fn optional_string(&self, name: &str) -> Result<Option<&str>, ApiError> {
+        if let Some(value) = self.json.as_ref().and_then(|json| json.get(name)) {
+            return value
+                .as_str()
+                .map(Some)
+                .ok_or_else(|| ApiError::invalid_parameter(name, "must be a string"));
+        }
+        Ok(self.string(name))
+    }
+
     fn unsigned(&self, name: &str) -> Result<Option<u64>, ApiError> {
         if let Some(value) = self.json.as_ref().and_then(|json| json.get(name)) {
             return value.as_u64().map(Some).ok_or_else(|| {
@@ -317,6 +330,10 @@ impl WireRequest {
 }
 
 enum ApiSuccess {
+    Batch {
+        action: &'static str,
+        result: BatchResult<Value, ApiError>,
+    },
     CreateQueue {
         queue_url: String,
     },
@@ -351,6 +368,7 @@ impl ApiSuccess {
 
     fn json_body(&self) -> String {
         let value = match self {
+            Self::Batch { result, .. } => batch_http::json_result(result),
             Self::CreateQueue { queue_url } => json!({ "QueueUrl": queue_url }),
             Self::SendMessage {
                 result,
@@ -389,6 +407,7 @@ impl ApiSuccess {
 
     fn xml_body(&self, request_id: &str) -> String {
         let (action, result) = match self {
+            Self::Batch { action, result } => (*action, batch_http::xml_result(action, result)),
             Self::CreateQueue { queue_url } => (
                 "CreateQueue",
                 format!("<QueueUrl>{}</QueueUrl>", xml_escape(queue_url)),
@@ -478,6 +497,12 @@ struct ApiError {
     message: String,
 }
 
+impl From<LqsError> for ApiError {
+    fn from(error: LqsError) -> Self {
+        map_lqs_error(error)
+    }
+}
+
 impl ApiError {
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -529,6 +554,9 @@ impl ApiError {
 
 fn dispatch(state: &AppState, path: &str, request: WireRequest) -> Result<ApiSuccess, ApiError> {
     match request.action.as_str() {
+        "SendMessageBatch" | "DeleteMessageBatch" | "ChangeMessageVisibilityBatch" => {
+            batch_http::execute(state, path, &request)
+        }
         "CreateQueue" => create_queue(state, &request),
         "SendMessage" => send_message(state, path, &request),
         "ReceiveMessage" => receive_message(state, path, &request),
@@ -860,16 +888,33 @@ fn send_message(
     request: &WireRequest,
 ) -> Result<ApiSuccess, ApiError> {
     let queue_name = queue_name(path, request)?;
+    let send_request = parse_send_request(request)?;
+    let body = send_request.body.clone();
+    let mut lqs = lock_lqs(state)?;
+    let is_fifo_message = lqs.queue_config(&queue_name)?.queue_type == QueueType::Fifo;
+    let result = lqs.send(&queue_name, send_request, unix_time_ms())?;
+    let sequence_number = is_fifo_message.then(|| sequence_number(&result.message_id));
+    Ok(ApiSuccess::SendMessage {
+        result,
+        body,
+        sequence_number,
+    })
+}
+
+fn parse_send_request(request: &WireRequest) -> Result<SendRequest, ApiError> {
     let body = request
         .string("MessageBody")
         .ok_or_else(|| ApiError::missing("MessageBody"))?
         .to_owned();
-    let message_group_id = request.string("MessageGroupId").map(str::to_owned);
-    let is_fifo_message = message_group_id.is_some();
-    let send_request = SendRequest {
-        body: body.clone(),
+    let message_group_id = request
+        .optional_string("MessageGroupId")?
+        .map(str::to_owned);
+    Ok(SendRequest {
+        body,
         message_group_id,
-        deduplication_id: request.string("MessageDeduplicationId").map(str::to_owned),
+        deduplication_id: request
+            .optional_string("MessageDeduplicationId")?
+            .map(str::to_owned),
         delay_ms: request
             .unsigned("DelaySeconds")?
             .map(|seconds| {
@@ -878,15 +923,6 @@ fn send_message(
                 })
             })
             .transpose()?,
-    };
-    let result = lock_lqs(state)?
-        .send(&queue_name, send_request, unix_time_ms())
-        .map_err(map_lqs_error)?;
-    let sequence_number = is_fifo_message.then(|| sequence_number(&result.message_id));
-    Ok(ApiSuccess::SendMessage {
-        result,
-        body,
-        sequence_number,
     })
 }
 
@@ -1021,6 +1057,7 @@ fn map_lqs_error(error: LqsError) -> ApiError {
         ),
         LqsError::InvalidReceiptHandle(_) => (StatusCode::BAD_REQUEST, "ReceiptHandleIsInvalid"),
         LqsError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+        LqsError::InvalidBatch(code) => (StatusCode::BAD_REQUEST, code),
         _ => (StatusCode::BAD_REQUEST, "InvalidParameterValue"),
     };
     ApiError::new(status, code, error.to_string())
