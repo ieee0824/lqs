@@ -45,7 +45,17 @@ HTTP層は `ServerConfig`、Axumルーター、SQLite-backed `Lqs`を分離し�
 
 DLQ移動・再投入の途中でDB操作が失敗すると、削除を含む全変更がロールバックされます。FIFOでは各キュー内の順序を維持しますが、失敗メッセージを別キューへ分離した後の業務処理全体の順序は保証しません。これは[AWSのDLQに関する注意](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)と同じ制約です。
 
-HTTPはJSON/Query双方でRedrivePolicyのCreate/Set/GetとListDeadLetterSourceQueuesに対応します。ARNは`arn:aws:sqs:us-east-1:000000000000:<queue-name>`固定です。非同期のStartMessageMoveTask/Cancel/List操作、RedriveAllowPolicy、メッセージ保持期限はこの実装の対象外です。
+HTTPはJSON/Query双方でRedrivePolicyのCreate/Set/GetとListDeadLetterSourceQueuesに対応します。ARNは`arn:aws:sqs:us-east-1:000000000000:<queue-name>`固定です。非同期のStartMessageMoveTask/Cancel/List操作とRedriveAllowPolicyはこの実装の対象外です。
+
+## 配信遅延・保持期限・本文サイズ
+
+`queues`に`delay_ms`、`message_retention_ms`、`maximum_message_size`を保存し、`messages.available_at_ms`に初回配信可能時刻を保存します。可視性タイムアウトとは独立した条件で候補を選択するため、受信後の再試行で初期遅延が再適用されません。既存DBへは列の有無を調べてトランザクション内で列を追加します。旧メッセージの配信可能時刻は0、旧キューは遅延0・保持4日・最大1 MiBになります。
+
+送受信はImmediateトランザクション内で最新設定を読み、`created_at_ms + message_retention_ms <= now_ms`の行を先に削除します。期限切れのFIFO先行メッセージは後続を妨げず、期限切れメッセージをDLQへ送ることもありません。StandardのDLQ移動は元送信時刻を保持するため、DLQ側の保持期限で判定します。FIFO移動は移動時刻から数えます。再投入前にも期限を確認し、有効なメッセージだけ新しい送信時刻と対象キューの遅延で再登録します。FIFOの重複排除ウィンドウはメッセージ保持期限とは独立です。
+
+本文はUTF-8バイト数で1〜キューの設定上限を検証し、重複排除より先に不正サイズを拒否します。HTTP全体の上限は8 MiBとして、1 MiB本文のJSON（最大6倍）・Query（最大3倍）エンコードを許容します。メッセージ属性を含むサイズ計算は属性実装（#7）の範囲です。
+
+複数の配信属性とRedrivePolicyの変更は原子的に処理します。保持期間変更は既存メッセージにも即時適用します。FIFOの遅延変更は未受信メッセージへ遡及し、受信済みメッセージの可視性期限は変更しません。Standardの既存メッセージは変更しません。AWSの非同期設定伝播は再現せず、決定的なローカルテストのため即時反映とします。
 
 ## 時刻とテスト容易性
 

@@ -7,6 +7,12 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 #[path = "dlq_tests.rs"]
 mod dlq_tests;
 
+#[cfg(test)]
+#[path = "delivery_tests.rs"]
+mod delivery_tests;
+
+pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueType {
     Standard,
@@ -37,6 +43,19 @@ pub struct QueueOptions {
     pub content_based_deduplication: bool,
     pub deduplication_window_ms: u64,
     pub redrive_policy: Option<RedrivePolicy>,
+    pub delay_ms: u64,
+    pub message_retention_ms: u64,
+    pub maximum_message_size: usize,
+}
+
+/// Partial update: None preserves the current setting.
+#[derive(Debug, Clone, Default)]
+pub struct QueueUpdate {
+    pub delay_ms: Option<u64>,
+    pub message_retention_ms: Option<u64>,
+    pub maximum_message_size: Option<usize>,
+    /// None preserves the policy; Some(None) removes it.
+    pub redrive_policy: Option<Option<RedrivePolicy>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +71,9 @@ impl Default for QueueOptions {
             content_based_deduplication: false,
             deduplication_window_ms: 300_000,
             redrive_policy: None,
+            delay_ms: 0,
+            message_retention_ms: 345_600_000,
+            maximum_message_size: MAX_MESSAGE_BYTES,
         }
     }
 }
@@ -61,6 +83,8 @@ pub struct SendRequest {
     pub body: String,
     pub message_group_id: Option<String>,
     pub deduplication_id: Option<String>,
+    /// Standard-only override; Some(0) disables the queue's default delay.
+    pub delay_ms: Option<u64>,
 }
 
 impl SendRequest {
@@ -69,6 +93,7 @@ impl SendRequest {
             body: body.into(),
             message_group_id: None,
             deduplication_id: None,
+            delay_ms: None,
         }
     }
     pub fn fifo(body: impl Into<String>, group_id: impl Into<String>) -> Self {
@@ -76,6 +101,7 @@ impl SendRequest {
             body: body.into(),
             message_group_id: Some(group_id.into()),
             deduplication_id: None,
+            delay_ms: None,
         }
     }
 }
@@ -107,6 +133,8 @@ pub enum LqsError {
     InvalidReceiptHandle(String),
     InvalidVisibilityTimeout,
     InvalidRedrivePolicy(String),
+    InvalidDeliveryOptions(String),
+    InvalidMessageSize { size: usize, maximum: usize },
     Database(String),
 }
 
@@ -131,6 +159,13 @@ impl fmt::Display for LqsError {
             }
             Self::Database(message) => write!(f, "database error: {message}"),
             Self::InvalidRedrivePolicy(message) => write!(f, "invalid redrive policy: {message}"),
+            Self::InvalidDeliveryOptions(message) => {
+                write!(f, "invalid delivery options: {message}")
+            }
+            Self::InvalidMessageSize { size, maximum } => write!(
+                f,
+                "message body is {size} bytes; must be 1..={maximum} bytes"
+            ),
         }
     }
 }
@@ -162,7 +197,7 @@ impl Lqs {
         Self::in_memory().expect("opening an in-memory SQLite database must succeed")
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, LqsError> {
+    fn from_connection(mut connection: Connection) -> Result<Self, LqsError> {
         connection.execute_batch(
             "
             PRAGMA foreign_keys = ON;
@@ -207,6 +242,38 @@ impl Lqs {
             );
             ",
         )?;
+        // Additive, transactional migration also upgrades databases from before #4.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (table, column, definition) in [
+            (
+                "queues",
+                "delay_ms",
+                "INTEGER NOT NULL DEFAULT 0 CHECK(delay_ms BETWEEN 0 AND 900000)",
+            ),
+            (
+                "queues",
+                "message_retention_ms",
+                "INTEGER NOT NULL DEFAULT 345600000 CHECK(message_retention_ms BETWEEN 60000 AND 1209600000)",
+            ),
+            (
+                "queues",
+                "maximum_message_size",
+                "INTEGER NOT NULL DEFAULT 1048576 CHECK(maximum_message_size BETWEEN 1024 AND 1048576)",
+            ),
+            ("messages", "available_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if !columns.iter().any(|name| name == column) {
+                transaction.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                ))?;
+            }
+        }
+        transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_created ON messages(queue_name, created_at_ms)")?;
+        transaction.commit()?;
         Ok(Self { connection })
     }
 
@@ -226,13 +293,18 @@ impl Lqs {
         if options.visibility_timeout_ms == 0 {
             return Err(LqsError::InvalidVisibilityTimeout);
         }
+        validate_delivery_options(
+            options.delay_ms,
+            options.message_retention_ms,
+            options.maximum_message_size,
+        )?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = transaction.execute(
-            "INSERT INTO queues(name, queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![name, queue_type.as_db_value(), ms(options.visibility_timeout_ms), i64::from(options.content_based_deduplication), ms(options.deduplication_window_ms)],
+            "INSERT INTO queues(name, queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms, delay_ms, message_retention_ms, maximum_message_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![name, queue_type.as_db_value(), ms(options.visibility_timeout_ms), i64::from(options.content_based_deduplication), ms(options.deduplication_window_ms), ms(options.delay_ms), ms(options.message_retention_ms), options.maximum_message_size],
         );
         match result {
             Ok(_) => {
@@ -253,12 +325,29 @@ impl Lqs {
         request: SendRequest,
         now_ms: u64,
     ) -> Result<SendResult, LqsError> {
-        let config = self.queue_config(queue_name)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let config = read_queue_config(&transaction, queue_name)?;
         let SendRequest {
             body,
             message_group_id,
             deduplication_id,
+            delay_ms,
         } = request;
+        if body.is_empty() || body.len() > config.maximum_message_size {
+            return Err(LqsError::InvalidMessageSize {
+                size: body.len(),
+                maximum: config.maximum_message_size,
+            });
+        }
+        if let Some(delay) = delay_ms
+            && (config.queue_type == QueueType::Fifo || delay > 900_000)
+        {
+            return Err(LqsError::InvalidDeliveryOptions(
+                "message delay must be 0-900000ms and is only allowed for Standard queues".into(),
+            ));
+        }
         let group_id = match config.queue_type {
             QueueType::Standard => message_group_id,
             QueueType::Fifo => {
@@ -269,9 +358,7 @@ impl Lqs {
                 Some(group)
             }
         };
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire_messages(&transaction, queue_name, ms(now_ms))?;
         let deduplication_id = if config.queue_type == QueueType::Fifo {
             let key = match deduplication_id {
                 Some(value) => value,
@@ -296,8 +383,8 @@ impl Lqs {
             None
         };
         transaction.execute(
-            "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms) VALUES (NULL, ?1, ?2, ?3, ?4)",
-            params![queue_name, body, group_id, ms(now_ms)],
+            "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms, available_at_ms) VALUES (NULL, ?1, ?2, ?3, ?4, ?5)",
+            params![queue_name, body, group_id, ms(now_ms), ms(now_ms).saturating_add(ms(delay_ms.unwrap_or(config.delay_ms)))],
         )?;
         let sequence = transaction.last_insert_rowid();
         let message_id = format!("msg-{sequence:016x}");
@@ -324,11 +411,12 @@ impl Lqs {
         max_messages: usize,
         now_ms: u64,
     ) -> Result<Vec<ReceivedMessage>, LqsError> {
-        let config = self.queue_config(queue_name)?;
         let now = ms(now_ms);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let config = read_queue_config(&transaction, queue_name)?;
+        expire_messages(&transaction, queue_name, now)?;
         let mut received = Vec::with_capacity(max_messages);
         let policy = read_redrive_policy(&transaction, queue_name)?;
         while received.len() < max_messages {
@@ -470,11 +558,14 @@ impl Lqs {
             ));
         }
         let mut moved = 0;
+        expire_messages(&transaction, dead_letter_queue, ms(now_ms))?;
+        expire_messages(&transaction, source_queue, ms(now_ms))?;
         while moved < max_messages {
             let candidate: Option<i64> = transaction.query_row(
                 "SELECT m.sequence FROM messages m JOIN dead_letter_origins o ON o.sequence = m.sequence
                  WHERE m.queue_name = ?1 AND o.source_queue = ?2
                  AND (m.invisible_until_ms IS NULL OR m.invisible_until_ms <= ?3)
+                 AND m.available_at_ms <= ?3
                  AND (?4 = 'standard' OR NOT EXISTS (
                      SELECT 1 FROM messages earlier WHERE earlier.queue_name = m.queue_name
                      AND earlier.group_id = m.group_id AND earlier.sequence < m.sequence))
@@ -491,19 +582,57 @@ impl Lqs {
     }
 
     pub(crate) fn queue_config(&self, queue_name: &str) -> Result<QueueConfig, LqsError> {
-        let row = self.connection.query_row(
-            "SELECT queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms FROM queues WHERE name = ?1",
-            params![queue_name],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
-        ).optional()?.ok_or_else(|| LqsError::QueueNotFound(queue_name.to_owned()))?;
-        Ok(QueueConfig {
-            queue_type: QueueType::from_db_value(&row.0)?,
-            visibility_timeout_ms: row.1 as u64,
-            content_based_deduplication: row.2 != 0,
-            deduplication_window_ms: row.3 as u64,
-            redrive_policy: read_redrive_policy(&self.connection, queue_name)?,
-        })
+        read_queue_config(&self.connection, queue_name)
     }
+
+    /// Updates delivery settings and optional redrive policy in one transaction.
+    pub fn set_queue_attributes(
+        &mut self,
+        name: &str,
+        update: QueueUpdate,
+        now_ms: u64,
+    ) -> Result<(), LqsError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = read_queue_config(&transaction, name)?;
+        let delay = update.delay_ms.unwrap_or(current.delay_ms);
+        let retention = update
+            .message_retention_ms
+            .unwrap_or(current.message_retention_ms);
+        let maximum = update
+            .maximum_message_size
+            .unwrap_or(current.maximum_message_size);
+        validate_delivery_options(delay, retention, maximum)?;
+        if let Some(policy) = update.redrive_policy {
+            write_redrive_policy(&transaction, name, policy.as_ref())?;
+        }
+        transaction.execute("UPDATE queues SET delay_ms = ?1, message_retention_ms = ?2, maximum_message_size = ?3 WHERE name = ?4", params![ms(delay), ms(retention), maximum, name])?;
+        if current.queue_type == QueueType::Fifo && delay != current.delay_ms {
+            transaction.execute("UPDATE messages SET available_at_ms = MIN(created_at_ms, ?1) + ?2 WHERE queue_name = ?3 AND receive_count = 0", params![i64::MAX - ms(delay), ms(delay), name])?;
+        }
+        expire_messages(&transaction, name, ms(now_ms))?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn read_queue_config(connection: &Connection, queue_name: &str) -> Result<QueueConfig, LqsError> {
+    let row = connection.query_row(
+            "SELECT queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms, delay_ms, message_retention_ms, maximum_message_size FROM queues WHERE name = ?1",
+            params![queue_name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, u64>(4)?, row.get::<_, u64>(5)?, row.get::<_, usize>(6)?)),
+        ).optional()?.ok_or_else(|| LqsError::QueueNotFound(queue_name.to_owned()))?;
+    Ok(QueueConfig {
+        queue_type: QueueType::from_db_value(&row.0)?,
+        visibility_timeout_ms: row.1 as u64,
+        content_based_deduplication: row.2 != 0,
+        deduplication_window_ms: row.3 as u64,
+        redrive_policy: read_redrive_policy(connection, queue_name)?,
+        delay_ms: row.4,
+        message_retention_ms: row.5,
+        maximum_message_size: row.6,
+    })
 }
 impl Default for Lqs {
     fn default() -> Self {
@@ -518,6 +647,24 @@ pub(crate) struct QueueConfig {
     pub(crate) content_based_deduplication: bool,
     pub(crate) deduplication_window_ms: u64,
     pub(crate) redrive_policy: Option<RedrivePolicy>,
+    pub(crate) delay_ms: u64,
+    pub(crate) message_retention_ms: u64,
+    pub(crate) maximum_message_size: usize,
+}
+
+fn validate_delivery_options(delay: u64, retention: u64, maximum: usize) -> Result<(), LqsError> {
+    if delay > 900_000
+        || !(60_000..=1_209_600_000).contains(&retention)
+        || !(1024..=MAX_MESSAGE_BYTES).contains(&maximum)
+    {
+        return Err(LqsError::InvalidDeliveryOptions("delay must be 0-900000ms, retention 60000-1209600000ms, maximum message size 1024-1048576 bytes".into()));
+    }
+    Ok(())
+}
+
+fn expire_messages(connection: &Connection, queue: &str, now: i64) -> Result<(), LqsError> {
+    connection.execute("DELETE FROM messages WHERE queue_name = ?1 AND created_at_ms <= ?2 - (SELECT message_retention_ms FROM queues WHERE name = ?1)", params![queue, now])?;
+    Ok(())
 }
 
 fn queue_type(connection: &Connection, name: &str) -> Result<QueueType, LqsError> {
@@ -597,9 +744,14 @@ fn move_message(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
     transaction.execute("DELETE FROM messages WHERE sequence = ?1", [sequence])?;
+    let delay = if new_identity {
+        read_queue_config(transaction, destination)?.delay_ms
+    } else {
+        0
+    };
     transaction.execute(
-        "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![if new_identity { None } else { Some(message_id) }, destination, body, group_id, if reset_timestamp { now } else { created_at }],
+        "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms, available_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![if new_identity { None } else { Some(message_id) }, destination, body, group_id, if reset_timestamp { now } else { created_at }, now.saturating_add(ms(delay))],
     )?;
     let moved = transaction.last_insert_rowid();
     if new_identity {
@@ -626,10 +778,10 @@ fn next_receivable(
 ) -> Result<Option<Candidate>, LqsError> {
     let sql = match queue_type {
         QueueType::Standard => {
-            "SELECT sequence, message_id, body, group_id, receive_count FROM messages WHERE queue_name = ?1 AND (invisible_until_ms IS NULL OR invisible_until_ms <= ?2) ORDER BY sequence LIMIT 1"
+            "SELECT sequence, message_id, body, group_id, receive_count FROM messages WHERE queue_name = ?1 AND available_at_ms <= ?2 AND (invisible_until_ms IS NULL OR invisible_until_ms <= ?2) ORDER BY sequence LIMIT 1"
         }
         QueueType::Fifo => {
-            "SELECT message.sequence, message.message_id, message.body, message.group_id, message.receive_count FROM messages AS message WHERE message.queue_name = ?1 AND (message.invisible_until_ms IS NULL OR message.invisible_until_ms <= ?2) AND NOT EXISTS (SELECT 1 FROM messages AS earlier WHERE earlier.queue_name = message.queue_name AND earlier.group_id = message.group_id AND earlier.sequence < message.sequence) ORDER BY message.sequence LIMIT 1"
+            "SELECT message.sequence, message.message_id, message.body, message.group_id, message.receive_count FROM messages AS message WHERE message.queue_name = ?1 AND message.available_at_ms <= ?2 AND (message.invisible_until_ms IS NULL OR message.invisible_until_ms <= ?2) AND NOT EXISTS (SELECT 1 FROM messages AS earlier WHERE earlier.queue_name = message.queue_name AND earlier.group_id = message.group_id AND earlier.sequence < message.sequence) ORDER BY message.sequence LIMIT 1"
         }
     };
     transaction

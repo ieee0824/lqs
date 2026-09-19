@@ -59,7 +59,23 @@ lqs.delete("orders.fifo", &message.receipt_handle)?;
 
 Rustでは`QueueOptions::redrive_policy`、`set_redrive_policy`、`redrive_policy`、`list_dead_letter_source_queues`を利用できます。再投入の基礎APIは`redrive_dead_letters(dlq, source, max_messages, now_ms)`です。元キューが一致する可視メッセージを新しいID・受信回数で元キューの末尾へ戻します。HTTPの非同期move-task APIは未実装です。
 
-属性管理は今回必要な範囲に対応しています。`SetQueueAttributes`は`RedrivePolicy`のみ、`GetQueueAttributes`は`QueueArn`・`RedrivePolicy`・`VisibilityTimeout`・FIFO設定と`All`を扱います。タグなどのキュー管理機能は別途実装予定です。
+属性管理は`RedrivePolicy`と下記の配信設定を扱います。`GetQueueAttributes`では`QueueArn`・`VisibilityTimeout`・FIFO設定と`All`も取得できます。タグなどのキュー管理機能は別途実装予定です。
+
+## 遅延・保持期限・サイズ制限
+
+`CreateQueue` / `SetQueueAttributes`で設定し、`GetQueueAttributes`で取得できます。
+
+| HTTP属性 | 範囲・既定値 | RustのQueueOptions |
+| --- | --- | --- |
+| `DelaySeconds` | 0〜900秒、既定0 | `delay_ms`（ミリ秒） |
+| `MessageRetentionPeriod` | 60〜1,209,600秒、既定345,600秒（4日） | `message_retention_ms`（ミリ秒） |
+| `MaximumMessageSize` | 1,024〜1,048,576バイト、既定1 MiB | `maximum_message_size` |
+
+本文自体は1バイトから設定上限まで送信できます。サイズはJSON/URLエンコード前のUTF-8バイト数です。Standardは`SendMessage.DelaySeconds`（Rustは`SendRequest.delay_ms`）でキュー既定値を上書きでき、明示的な0は即時配信になります。FIFOはキュー単位のみで、メッセージ単位の指定は0を含めエラーになります。
+
+遅延は初回配信、可視性タイムアウトは受信後の再配信に適用します。保持期限は送信時刻から数え、遅延中・処理中でも期限到達後は配信しません。送信・受信・再投入時に対象キューの期限切れデータを削除します。`queue_depth`は時刻を受け取らないため、削除前の期限切れ行を含む物理件数です。
+
+設定変更はLQSでは即時反映されます。保持期間を短くすると既存メッセージにも適用します。Standardの遅延変更は新規メッセージだけ、FIFOでは未受信メッセージの遅延期限も更新します。Rustからは`set_queue_attributes(name, QueueUpdate { .. }, now_ms)`で更新できます。
 
 ## テスト
 
@@ -75,3 +91,4 @@ LQS_ENDPOINT=http://127.0.0.1:9324 go test -v ./...
 
 GitHub ActionsではRustの整形・Clippy・単体テストに続けてLQSサーバーを起動し、Go SDKからFIFOキューの作成、送信、受信、可視性変更、削除、エラーコードの復元を検証します。
 DLQについてもStandard/FIFOの転送、属性設定・取得、ソース一覧のページング、ポリシー解除、不正設定時のHTTP 400を同じCIで検証します。
+遅延・1 MiB本文・設定上限・UTF-8サイズ・保持期限もGo SDKから検証します。保持期限テストはSQSの最短設定60秒を実時間で検証するため、結合テスト全体は約1分以上かかります。
