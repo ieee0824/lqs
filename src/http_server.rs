@@ -18,12 +18,14 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use crate::{
-    Lqs, LqsError, QueueOptions, QueueType, ReceivedMessage, RedrivePolicy, SendRequest, SendResult,
+    Lqs, LqsError, QueueOptions, QueueType, QueueUpdate, ReceivedMessage, RedrivePolicy,
+    SendRequest, SendResult,
 };
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:9324";
 const DEFAULT_DATABASE_PATH: &str = "lqs.sqlite";
-const MAX_REQUEST_BYTES: usize = 1_048_576;
+// A 1 MiB decoded body can expand up to 6x in JSON, or 3x in Query encoding.
+const MAX_REQUEST_BYTES: usize = 8 * 1_048_576;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -573,14 +575,18 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
     } else {
         QueueType::Standard
     };
+    let delivery = delivery_attributes(&attributes)?;
     let options = QueueOptions {
         visibility_timeout_ms,
         content_based_deduplication,
-        redrive_policy: attributes
-            .get("RedrivePolicy")
-            .map(|value| parse_redrive_policy(value))
-            .transpose()?
-            .flatten(),
+        redrive_policy: delivery.redrive_policy.flatten(),
+        delay_ms: delivery.delay_ms.unwrap_or(0),
+        message_retention_ms: delivery
+            .message_retention_ms
+            .unwrap_or(QueueOptions::default().message_retention_ms),
+        maximum_message_size: delivery
+            .maximum_message_size
+            .unwrap_or(QueueOptions::default().maximum_message_size),
         ..QueueOptions::default()
     };
     let mut lqs = lock_lqs(state)?;
@@ -595,6 +601,9 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
                             == options.content_based_deduplication
                         && existing.deduplication_window_ms == options.deduplication_window_ms
                         && existing.redrive_policy == options.redrive_policy
+                        && existing.delay_ms == options.delay_ms
+                        && existing.message_retention_ms == options.message_retention_ms
+                        && existing.maximum_message_size == options.maximum_message_size
                 })
                 .unwrap_or(false);
         if !same_configuration {
@@ -641,6 +650,33 @@ fn parse_redrive_policy(value: &str) -> Result<Option<RedrivePolicy>, ApiError> 
     }))
 }
 
+fn delivery_attributes(attributes: &HashMap<String, String>) -> Result<QueueUpdate, ApiError> {
+    Ok(QueueUpdate {
+        delay_ms: attributes
+            .get("DelaySeconds")
+            .map(|value| parse_seconds("DelaySeconds", value, 0, 900).map(|seconds| seconds * 1000))
+            .transpose()?,
+        message_retention_ms: attributes
+            .get("MessageRetentionPeriod")
+            .map(|value| {
+                parse_seconds("MessageRetentionPeriod", value, 60, 1_209_600)
+                    .map(|seconds| seconds * 1000)
+            })
+            .transpose()?,
+        maximum_message_size: attributes
+            .get("MaximumMessageSize")
+            .map(|value| {
+                parse_seconds("MaximumMessageSize", value, 1024, 1_048_576)
+                    .map(|bytes| bytes as usize)
+            })
+            .transpose()?,
+        redrive_policy: attributes
+            .get("RedrivePolicy")
+            .map(|value| parse_redrive_policy(value))
+            .transpose()?,
+    })
+}
+
 fn set_queue_attributes(
     state: &AppState,
     path: &str,
@@ -648,16 +684,26 @@ fn set_queue_attributes(
 ) -> Result<ApiSuccess, ApiError> {
     let name = queue_name(path, request)?;
     let attributes = request.attributes()?;
-    if attributes.len() != 1 || !attributes.contains_key("RedrivePolicy") {
+    if attributes.is_empty()
+        || attributes.keys().any(|name| {
+            ![
+                "RedrivePolicy",
+                "DelaySeconds",
+                "MessageRetentionPeriod",
+                "MaximumMessageSize",
+            ]
+            .contains(&name.as_str())
+        })
+    {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "InvalidAttributeName",
-            "only RedrivePolicy can currently be set",
+            "supported attributes: RedrivePolicy, DelaySeconds, MessageRetentionPeriod, MaximumMessageSize",
         ));
     }
-    let policy = parse_redrive_policy(&attributes["RedrivePolicy"])?;
+    let update = delivery_attributes(&attributes)?;
     lock_lqs(state)?
-        .set_redrive_policy(&name, policy)
+        .set_queue_attributes(&name, update, unix_time_ms())
         .map_err(map_lqs_error)?;
     Ok(ApiSuccess::SetQueueAttributes)
 }
@@ -700,6 +746,18 @@ fn get_queue_attributes(
     let mut attributes = HashMap::from([
         ("QueueArn".to_owned(), format!("{QUEUE_ARN_PREFIX}{name}")),
         (
+            "DelaySeconds".to_owned(),
+            (config.delay_ms / 1000).to_string(),
+        ),
+        (
+            "MessageRetentionPeriod".to_owned(),
+            (config.message_retention_ms / 1000).to_string(),
+        ),
+        (
+            "MaximumMessageSize".to_owned(),
+            config.maximum_message_size.to_string(),
+        ),
+        (
             "VisibilityTimeout".to_owned(),
             (config.visibility_timeout_ms / 1000).to_string(),
         ),
@@ -729,6 +787,9 @@ fn get_queue_attributes(
             "FifoQueue",
             "ContentBasedDeduplication",
             "RedrivePolicy",
+            "DelaySeconds",
+            "MessageRetentionPeriod",
+            "MaximumMessageSize",
         ]
         .contains(name)
         {
@@ -799,13 +860,24 @@ fn send_message(
     request: &WireRequest,
 ) -> Result<ApiSuccess, ApiError> {
     let queue_name = queue_name(path, request)?;
-    let body = request.required_string("MessageBody")?.to_owned();
+    let body = request
+        .string("MessageBody")
+        .ok_or_else(|| ApiError::missing("MessageBody"))?
+        .to_owned();
     let message_group_id = request.string("MessageGroupId").map(str::to_owned);
     let is_fifo_message = message_group_id.is_some();
     let send_request = SendRequest {
         body: body.clone(),
         message_group_id,
         deduplication_id: request.string("MessageDeduplicationId").map(str::to_owned),
+        delay_ms: request
+            .unsigned("DelaySeconds")?
+            .map(|seconds| {
+                seconds.checked_mul(1000).ok_or_else(|| {
+                    ApiError::invalid_parameter("DelaySeconds", "must be between 0 and 900")
+                })
+            })
+            .transpose()?,
     };
     let result = lock_lqs(state)?
         .send(&queue_name, send_request, unix_time_ms())
