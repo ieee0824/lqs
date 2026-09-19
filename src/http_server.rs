@@ -25,6 +25,10 @@ use crate::{
 #[path = "batch_http.rs"]
 mod batch_http;
 
+#[cfg(test)]
+#[path = "polling_http_tests.rs"]
+mod polling_http_tests;
+
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:9324";
 const DEFAULT_DATABASE_PATH: &str = "lqs.sqlite";
 // A 1 MiB decoded body can expand up to 6x in JSON, or 3x in Query encoding.
@@ -182,7 +186,12 @@ async fn handle_request(State(state): State<AppState>, request: Request) -> Resp
         }
     };
     let protocol = wire_request.protocol;
-    match dispatch(&state, &path, wire_request) {
+    let result = if wire_request.action == "ReceiveMessage" {
+        receive_message(&state, &path, &wire_request).await
+    } else {
+        dispatch(&state, &path, wire_request)
+    };
+    match result {
         Ok(success) => success.into_response(protocol, &request_id),
         Err(error) => error.into_response(protocol, &request_id),
     }
@@ -559,7 +568,6 @@ fn dispatch(state: &AppState, path: &str, request: WireRequest) -> Result<ApiSuc
         }
         "CreateQueue" => create_queue(state, &request),
         "SendMessage" => send_message(state, path, &request),
-        "ReceiveMessage" => receive_message(state, path, &request),
         "DeleteMessage" => delete_message(state, path, &request),
         "ChangeMessageVisibility" => change_message_visibility(state, path, &request),
         "SetQueueAttributes" => set_queue_attributes(state, path, &request),
@@ -615,6 +623,10 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
         maximum_message_size: delivery
             .maximum_message_size
             .unwrap_or(QueueOptions::default().maximum_message_size),
+        receive_wait_time_ms: delivery.receive_wait_time_ms.unwrap_or(0),
+        max_in_flight: delivery
+            .max_in_flight
+            .unwrap_or(QueueOptions::default().max_in_flight),
         ..QueueOptions::default()
     };
     let mut lqs = lock_lqs(state)?;
@@ -632,6 +644,8 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
                         && existing.delay_ms == options.delay_ms
                         && existing.message_retention_ms == options.message_retention_ms
                         && existing.maximum_message_size == options.maximum_message_size
+                        && existing.receive_wait_time_ms == options.receive_wait_time_ms
+                        && existing.max_in_flight == options.max_in_flight
                 })
                 .unwrap_or(false);
         if !same_configuration {
@@ -680,6 +694,25 @@ fn parse_redrive_policy(value: &str) -> Result<Option<RedrivePolicy>, ApiError> 
 
 fn delivery_attributes(attributes: &HashMap<String, String>) -> Result<QueueUpdate, ApiError> {
     Ok(QueueUpdate {
+        receive_wait_time_ms: attributes
+            .get("ReceiveMessageWaitTimeSeconds")
+            .map(|value| {
+                parse_seconds("ReceiveMessageWaitTimeSeconds", value, 0, 20)
+                    .map(|seconds| seconds * 1000)
+            })
+            .transpose()?,
+        max_in_flight: attributes
+            .get("LqsMaxInFlightMessages")
+            .map(|value| {
+                parse_seconds(
+                    "LqsMaxInFlightMessages",
+                    value,
+                    1,
+                    crate::DEFAULT_MAX_IN_FLIGHT as u64,
+                )
+                .map(|count| count as usize)
+            })
+            .transpose()?,
         delay_ms: attributes
             .get("DelaySeconds")
             .map(|value| parse_seconds("DelaySeconds", value, 0, 900).map(|seconds| seconds * 1000))
@@ -719,6 +752,8 @@ fn set_queue_attributes(
                 "DelaySeconds",
                 "MessageRetentionPeriod",
                 "MaximumMessageSize",
+                "ReceiveMessageWaitTimeSeconds",
+                "LqsMaxInFlightMessages",
             ]
             .contains(&name.as_str())
         })
@@ -726,7 +761,7 @@ fn set_queue_attributes(
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "InvalidAttributeName",
-            "supported attributes: RedrivePolicy, DelaySeconds, MessageRetentionPeriod, MaximumMessageSize",
+            "supported attributes: RedrivePolicy, DelaySeconds, MessageRetentionPeriod, MaximumMessageSize, ReceiveMessageWaitTimeSeconds, LqsMaxInFlightMessages",
         ));
     }
     let update = delivery_attributes(&attributes)?;
@@ -774,6 +809,20 @@ fn get_queue_attributes(
     let mut attributes = HashMap::from([
         ("QueueArn".to_owned(), format!("{QUEUE_ARN_PREFIX}{name}")),
         (
+            "ReceiveMessageWaitTimeSeconds".to_owned(),
+            (config.receive_wait_time_ms / 1000).to_string(),
+        ),
+        (
+            "LqsMaxInFlightMessages".to_owned(),
+            config.max_in_flight.to_string(),
+        ),
+        (
+            "ApproximateNumberOfMessagesNotVisible".to_owned(),
+            lock_lqs(state)?
+                .in_flight_count(&name, unix_time_ms())?
+                .to_string(),
+        ),
+        (
             "DelaySeconds".to_owned(),
             (config.delay_ms / 1000).to_string(),
         ),
@@ -818,6 +867,9 @@ fn get_queue_attributes(
             "DelaySeconds",
             "MessageRetentionPeriod",
             "MaximumMessageSize",
+            "ReceiveMessageWaitTimeSeconds",
+            "LqsMaxInFlightMessages",
+            "ApproximateNumberOfMessagesNotVisible",
         ]
         .contains(name)
         {
@@ -926,7 +978,7 @@ fn parse_send_request(request: &WireRequest) -> Result<SendRequest, ApiError> {
     })
 }
 
-fn receive_message(
+async fn receive_message(
     state: &AppState,
     path: &str,
     request: &WireRequest,
@@ -939,10 +991,40 @@ fn receive_message(
             "must be between 1 and 10",
         ));
     }
-    let messages = lock_lqs(state)?
-        .receive(&queue_name, max_messages as usize, unix_time_ms())
-        .map_err(map_lqs_error)?;
-    Ok(ApiSuccess::ReceiveMessage { messages })
+    let requested_wait = request.unsigned("WaitTimeSeconds")?;
+    if requested_wait.is_some_and(|seconds| seconds > 20) {
+        return Err(ApiError::invalid_parameter(
+            "WaitTimeSeconds",
+            "must be between 0 and 20",
+        ));
+    }
+    let wait_ms = requested_wait.map(|seconds| seconds * 1000).unwrap_or(
+        lock_lqs(state)?
+            .queue_config(&queue_name)?
+            .receive_wait_time_ms,
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    loop {
+        // Neither the Mutex nor the SQLite transaction lives across the await below.
+        let result =
+            { lock_lqs(state)?.receive(&queue_name, max_messages as usize, unix_time_ms()) };
+        match result {
+            Ok(messages) if !messages.is_empty() => {
+                return Ok(ApiSuccess::ReceiveMessage { messages });
+            }
+            Ok(_) => {}
+            Err(LqsError::OverLimit) if wait_ms > 0 => {}
+            Err(error) => return Err(error.into()),
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(ApiSuccess::ReceiveMessage {
+                messages: Vec::new(),
+            });
+        }
+        // Also detects time-driven availability and writes from other DB connections.
+        tokio::time::sleep_until(deadline.min(now + std::time::Duration::from_millis(100))).await;
+    }
 }
 
 fn delete_message(
@@ -1058,6 +1140,8 @@ fn map_lqs_error(error: LqsError) -> ApiError {
         LqsError::InvalidReceiptHandle(_) => (StatusCode::BAD_REQUEST, "ReceiptHandleIsInvalid"),
         LqsError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
         LqsError::InvalidBatch(code) => (StatusCode::BAD_REQUEST, code),
+        LqsError::OverLimit => (StatusCode::BAD_REQUEST, "OverLimit"),
+        LqsError::MessageNotInflight => (StatusCode::BAD_REQUEST, "MessageNotInflight"),
         _ => (StatusCode::BAD_REQUEST, "InvalidParameterValue"),
     };
     ApiError::new(status, code, error.to_string())

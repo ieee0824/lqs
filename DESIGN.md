@@ -69,12 +69,26 @@ HTTPはJSON/Query双方でRedrivePolicyのCreate/Set/GetとListDeadLetterSourceQ
 
 複数の配信属性とRedrivePolicyの変更は原子的に処理します。保持期間変更は既存メッセージにも即時適用します。FIFOの遅延変更は未受信メッセージへ遡及し、受信済みメッセージの可視性期限は変更しません。Standardの既存メッセージは変更しません。AWSの非同期設定伝播は再現せず、決定的なローカルテストのため即時反映とします。
 
+## ロングポーリングとin-flight管理
+
+キューの既定待機時間`receive_wait_time_ms`（0〜20,000ms、既定0）と`max_in_flight`（1〜120,000、既定120,000）を永続化します。既存DBには既定値付きの列を追加し、受信済みメッセージの可視性期限や受信回数は保持します。HTTPは`ReceiveMessageWaitTimeSeconds`を秒で扱います。`LqsMaxInFlightMessages`はローカルの上限再現用拡張で、AWSの属性ではありません。
+
+HTTPの受信だけを非同期処理にし、同期ライブラリの`receive`を最大100msごとに再実行します。キュー既定値はリクエスト開始時に読み、`WaitTimeSeconds`が指定されれば0を含め優先します。待機期限はTokioの単調時計で一度だけ設定し、再試行や設定変更で延長しません。受信成功は期限前に返し、利用可能なメッセージがない場合は期限到達後にのみ空を返します。未知のキュー・不正入力・DB障害は待機せずエラーを返します。
+
+各再試行ではMutexとSQLiteトランザクションを解放してから`sleep_until`します。通知の取りこぼしを避けるため、ローカル向けの単純な定期ポーリングを採用します。新規送信・削除・バッチ操作だけでなく、遅延や可視性期限・保持期限の終了、別プロセスの更新にも追従します。HTTP受信futureを破棄すると次のポーリングは行われず、バックグラウンド受信タスクは残しません。待機数に応じた定期クエリの負荷は発生し、高負荷用途のイベント駆動最適化は対象外です。
+
+in-flightは「保持期限内かつ`invisible_until_ms > now_ms`」の実件数です。独立したカウンターは持たず、`messages(queue_name, invisible_until_ms)`索引を使って計測します。`receive`のImmediateトランザクション内で期限切れ削除、件数確認、残り枠まで（かつ最大10件）の配信を行うため、別接続から競合しても上限を超えて受信できません。`ChangeMessageVisibility`は現在in-flightのメッセージだけを更新し、期限切れハンドルの復活による上限回避を防ぎます。
+
+上限到達時のStandardの同期/短ポーリングは`OverLimit`、FIFOの同期/短ポーリングは空結果です。HTTPのロングポーリングでは両種とも上限を理由に早期終了せず、枠が空くか期限になるまで再試行します。削除、可視性終了、保持期限で枠が戻り、上限引き下げは既存のin-flightメッセージを取り消しません。設定変更後の再試行は最新上限を読みます。`ApproximateNumberOfMessagesNotVisible`はローカルで計測した実件数を返します。
+
+仕様参照: [ReceiveMessage](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html)、[可視性期限と上限](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html)、[FIFO上限](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-fifo.html)。
+
 ## 時刻とテスト容易性
 
-API はホストの時計を直接読まず、呼び出し側から単調増加の `now_ms` を渡します。これにより、可視性タイムアウトと重複排除の境界を sleep なしで決定的にテストできます。実運用用のアダプターでは `Instant` などの単調時計をミリ秒へ変換して渡します。
+同期ライブラリAPIはホストの時計を直接読まず、呼び出し側から `now_ms` を渡します。これにより、可視性タイムアウトと重複排除の境界を sleep なしで決定的にテストできます。永続DBを利用するHTTP層は再起動をまたいで比較できるUnix時刻をメッセージ期限に使い、リクエスト待機時間だけは単調時計で管理します。
 
 ## 境界と将来の拡張
 
-- SQLiteファイルへの永続化とDLQ転送に対応。ロングポーリングは未実装。
+- SQLiteファイルへの永続化、DLQ転送、最大20秒のロングポーリングに対応。
 - APIエラーは `LqsError` として返し、設定または送信・受信の誤りを明示する。
 - FIFO のスループット分割は `MessageGroupId` が単位。独立した処理を並列化したい場合はグループを分ける。

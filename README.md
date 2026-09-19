@@ -87,6 +87,21 @@ Rustでは`QueueOptions::redrive_policy`、`set_redrive_policy`、`redrive_polic
 
 設定変更はLQSでは即時反映されます。保持期間を短くすると既存メッセージにも適用します。Standardの遅延変更は新規メッセージだけ、FIFOでは未受信メッセージの遅延期限も更新します。Rustからは`set_queue_attributes(name, QueueUpdate { .. }, now_ms)`で更新できます。
 
+## ロングポーリングとin-flight上限
+
+`ReceiveMessage.WaitTimeSeconds`は0〜20秒です。省略時はキュー属性`ReceiveMessageWaitTimeSeconds`（既定0秒）、明示的な0は即時の短ポーリングになります。キュー属性は`CreateQueue` / `SetQueueAttributes` / `GetQueueAttributes`で管理できます。Rustの設定は`QueueOptions::receive_wait_time_ms` / `QueueUpdate::receive_wait_time_ms`です。
+
+ロングポーリングは、受信可能なメッセージが見つかるとすぐ返り、見つからない間は指定期限まで待ちます。待機中にDBをロックせず100ms間隔で再確認するので、他の送受信、遅延や可視性期限の終了、別DB接続からの書き込みにも対応します。`MaxNumberOfMessages`（Rustの`receive`の件数引数も同様）は1〜10件です。Rustの同期`receive`自体は待機せず、HTTP層が非同期の待機を行います。
+
+in-flight上限はキューごとに既定120,000件です。ローカル検証用の独自属性`LqsMaxInFlightMessages`（1〜120,000件）で小さくできます。この属性はAWSにはありません。Rustでは`QueueOptions::max_in_flight` / `QueueUpdate::max_in_flight`で設定します。
+
+| 上限到達時 | Standard | FIFO |
+| --- | --- | --- |
+| 短ポーリング | HTTP 400 `OverLimit` | 空結果 |
+| ロングポーリング | 空きができるまで待機、期限到達で空結果 | 同左 |
+
+削除、可視性期限の終了・0への変更、保持期限で空きが戻ります。`GetQueueAttributes`の`ApproximateNumberOfMessagesNotVisible`とRustの`in_flight_count(queue, now_ms)`で現在の件数を取得できます。上限を現在の件数より小さくしても受信済みメッセージは取り消さず、件数が下がるまで新規受信を止めます。可視性期限切れのハンドルでの延長は`MessageNotInflight`になります。
+
 ## テスト
 
 Rustの単体テストと、実際のHTTPサーバーへAWS SDK for Go v2で接続する結合テストがあります。
@@ -103,3 +118,4 @@ GitHub ActionsではRustの整形・Clippy・単体テストに続けてLQSサ�
 DLQについてもStandard/FIFOの転送、属性設定・取得、ソース一覧のページング、ポリシー解除、不正設定時のHTTP 400を同じCIで検証します。
 遅延・1 MiB本文・設定上限・UTF-8サイズ・保持期限もGo SDKから検証します。保持期限テストはSQSの最短設定60秒を実時間で検証するため、結合テスト全体は約1分以上かかります。
 バッチ3操作の部分成功、全体エラー、FIFO順序・重複排除、Queryの数値順・XMLエラーも検証します。RustテストではDB障害の注入と再起動後の永続化も確認します。
+ロングポーリングの到着・期限・設定上書きと、Standard/FIFOのin-flight上限・バッチ操作による空きの解放も結合テストに含みます。Rustでは競合する待機リクエスト、別DB接続からの書き込み、同時受信の上限保証、待機futureのキャンセルと既存DB移行も確認します。

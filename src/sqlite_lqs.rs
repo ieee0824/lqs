@@ -15,7 +15,12 @@ mod delivery_tests;
 #[path = "batch_tests.rs"]
 mod batch_tests;
 
+#[cfg(test)]
+#[path = "polling_tests.rs"]
+mod polling_tests;
+
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 120_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueType {
@@ -50,6 +55,9 @@ pub struct QueueOptions {
     pub delay_ms: u64,
     pub message_retention_ms: u64,
     pub maximum_message_size: usize,
+    pub receive_wait_time_ms: u64,
+    /// Local quota, configurable downward for deterministic tests.
+    pub max_in_flight: usize,
 }
 
 /// Partial update: None preserves the current setting.
@@ -58,6 +66,8 @@ pub struct QueueUpdate {
     pub delay_ms: Option<u64>,
     pub message_retention_ms: Option<u64>,
     pub maximum_message_size: Option<usize>,
+    pub receive_wait_time_ms: Option<u64>,
+    pub max_in_flight: Option<usize>,
     /// None preserves the policy; Some(None) removes it.
     pub redrive_policy: Option<Option<RedrivePolicy>>,
 }
@@ -78,6 +88,8 @@ impl Default for QueueOptions {
             delay_ms: 0,
             message_retention_ms: 345_600_000,
             maximum_message_size: MAX_MESSAGE_BYTES,
+            receive_wait_time_ms: 0,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
         }
     }
 }
@@ -141,6 +153,9 @@ pub enum LqsError {
     InvalidMessageSize { size: usize, maximum: usize },
     InvalidBatch(&'static str),
     InvalidMessageIdentifier(&'static str),
+    InvalidReceiveOptions,
+    OverLimit,
+    MessageNotInflight,
     Database(String),
 }
 
@@ -164,6 +179,12 @@ impl fmt::Display for LqsError {
                 write!(f, "visibility timeout must be greater than zero")
             }
             Self::Database(message) => write!(f, "database error: {message}"),
+            Self::InvalidReceiveOptions => write!(
+                f,
+                "receive count must be 1-10, wait time 0-20000ms, and in-flight quota 1-120000"
+            ),
+            Self::OverLimit => write!(f, "in-flight message limit reached"),
+            Self::MessageNotInflight => write!(f, "message is no longer in flight"),
             Self::InvalidBatch(code) => write!(f, "invalid batch request: {code}"),
             Self::InvalidMessageIdentifier(name) => write!(
                 f,
@@ -272,6 +293,16 @@ impl Lqs {
                 "INTEGER NOT NULL DEFAULT 1048576 CHECK(maximum_message_size BETWEEN 1024 AND 1048576)",
             ),
             ("messages", "available_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+            (
+                "queues",
+                "receive_wait_time_ms",
+                "INTEGER NOT NULL DEFAULT 0 CHECK(receive_wait_time_ms BETWEEN 0 AND 20000)",
+            ),
+            (
+                "queues",
+                "max_in_flight",
+                "INTEGER NOT NULL DEFAULT 120000 CHECK(max_in_flight BETWEEN 1 AND 120000)",
+            ),
         ] {
             let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
             let columns = statement
@@ -284,6 +315,7 @@ impl Lqs {
             }
         }
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_created ON messages(queue_name, created_at_ms)")?;
+        transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_inflight ON messages(queue_name, invisible_until_ms)")?;
         transaction.commit()?;
         Ok(Self { connection })
     }
@@ -309,13 +341,14 @@ impl Lqs {
             options.message_retention_ms,
             options.maximum_message_size,
         )?;
+        validate_receive_options(options.receive_wait_time_ms, options.max_in_flight)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = transaction.execute(
-            "INSERT INTO queues(name, queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms, delay_ms, message_retention_ms, maximum_message_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![name, queue_type.as_db_value(), ms(options.visibility_timeout_ms), i64::from(options.content_based_deduplication), ms(options.deduplication_window_ms), ms(options.delay_ms), ms(options.message_retention_ms), options.maximum_message_size],
+            "INSERT INTO queues(name, queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms, delay_ms, message_retention_ms, maximum_message_size, receive_wait_time_ms, max_in_flight)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![name, queue_type.as_db_value(), ms(options.visibility_timeout_ms), i64::from(options.content_based_deduplication), ms(options.deduplication_window_ms), ms(options.delay_ms), ms(options.message_retention_ms), options.maximum_message_size, ms(options.receive_wait_time_ms), options.max_in_flight],
         );
         match result {
             Ok(_) => {
@@ -433,12 +466,25 @@ impl Lqs {
         max_messages: usize,
         now_ms: u64,
     ) -> Result<Vec<ReceivedMessage>, LqsError> {
+        if !(1..=10).contains(&max_messages) {
+            return Err(LqsError::InvalidReceiveOptions);
+        }
         let now = ms(now_ms);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let config = read_queue_config(&transaction, queue_name)?;
         expire_messages(&transaction, queue_name, now)?;
+        let in_flight = count_in_flight(&transaction, queue_name, now)?;
+        if in_flight >= config.max_in_flight {
+            transaction.commit()?;
+            return if config.queue_type == QueueType::Standard {
+                Err(LqsError::OverLimit)
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let max_messages = max_messages.min(config.max_in_flight - in_flight);
         let mut received = Vec::with_capacity(max_messages);
         let policy = read_redrive_policy(&transaction, queue_name)?;
         while received.len() < max_messages {
@@ -512,14 +558,26 @@ impl Lqs {
         }
         self.queue_config(queue_name)?;
         let count = self.connection.execute(
-            "UPDATE messages SET invisible_until_ms = ?1 WHERE queue_name = ?2 AND receipt_handle = ?3",
-            params![ms(now_ms).saturating_add(ms(timeout_ms)), queue_name, receipt_handle],
+            "UPDATE messages SET invisible_until_ms = ?1 WHERE queue_name = ?2 AND receipt_handle = ?3
+             AND invisible_until_ms > ?4 AND created_at_ms > ?4 - (SELECT message_retention_ms FROM queues WHERE name = ?2)",
+            params![ms(now_ms).saturating_add(ms(timeout_ms)), queue_name, receipt_handle, ms(now_ms)],
         )?;
         if count == 1 {
             Ok(())
         } else {
-            Err(LqsError::InvalidReceiptHandle(receipt_handle.to_owned()))
+            let exists: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE queue_name = ?1 AND receipt_handle = ?2)", params![queue_name, receipt_handle], |row| row.get(0))?;
+            if exists {
+                Err(LqsError::MessageNotInflight)
+            } else {
+                Err(LqsError::InvalidReceiptHandle(receipt_handle.to_owned()))
+            }
         }
+    }
+
+    /// Current nonexpired messages with a visibility deadline strictly after now.
+    pub fn in_flight_count(&self, queue_name: &str, now_ms: u64) -> Result<usize, LqsError> {
+        self.queue_config(queue_name)?;
+        count_in_flight(&self.connection, queue_name, ms(now_ms))
     }
 
     pub fn queue_depth(&self, queue_name: &str) -> Result<usize, LqsError> {
@@ -630,11 +688,16 @@ impl Lqs {
         let maximum = update
             .maximum_message_size
             .unwrap_or(current.maximum_message_size);
+        let wait = update
+            .receive_wait_time_ms
+            .unwrap_or(current.receive_wait_time_ms);
+        let max_in_flight = update.max_in_flight.unwrap_or(current.max_in_flight);
         validate_delivery_options(delay, retention, maximum)?;
+        validate_receive_options(wait, max_in_flight)?;
         if let Some(policy) = update.redrive_policy {
             write_redrive_policy(&transaction, name, policy.as_ref())?;
         }
-        transaction.execute("UPDATE queues SET delay_ms = ?1, message_retention_ms = ?2, maximum_message_size = ?3 WHERE name = ?4", params![ms(delay), ms(retention), maximum, name])?;
+        transaction.execute("UPDATE queues SET delay_ms = ?1, message_retention_ms = ?2, maximum_message_size = ?3, receive_wait_time_ms = ?5, max_in_flight = ?6 WHERE name = ?4", params![ms(delay), ms(retention), maximum, name, ms(wait), max_in_flight])?;
         if current.queue_type == QueueType::Fifo && delay != current.delay_ms {
             transaction.execute("UPDATE messages SET available_at_ms = MIN(created_at_ms, ?1) + ?2 WHERE queue_name = ?3 AND receive_count = 0", params![i64::MAX - ms(delay), ms(delay), name])?;
         }
@@ -646,9 +709,9 @@ impl Lqs {
 
 fn read_queue_config(connection: &Connection, queue_name: &str) -> Result<QueueConfig, LqsError> {
     let row = connection.query_row(
-            "SELECT queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms, delay_ms, message_retention_ms, maximum_message_size FROM queues WHERE name = ?1",
+            "SELECT queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms, delay_ms, message_retention_ms, maximum_message_size, receive_wait_time_ms, max_in_flight FROM queues WHERE name = ?1",
             params![queue_name],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, u64>(4)?, row.get::<_, u64>(5)?, row.get::<_, usize>(6)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, u64>(4)?, row.get::<_, u64>(5)?, row.get::<_, usize>(6)?, row.get::<_, u64>(7)?, row.get::<_, usize>(8)?)),
         ).optional()?.ok_or_else(|| LqsError::QueueNotFound(queue_name.to_owned()))?;
     Ok(QueueConfig {
         queue_type: QueueType::from_db_value(&row.0)?,
@@ -659,6 +722,8 @@ fn read_queue_config(connection: &Connection, queue_name: &str) -> Result<QueueC
         delay_ms: row.4,
         message_retention_ms: row.5,
         maximum_message_size: row.6,
+        receive_wait_time_ms: row.7,
+        max_in_flight: row.8,
     })
 }
 impl Default for Lqs {
@@ -677,6 +742,19 @@ pub(crate) struct QueueConfig {
     pub(crate) delay_ms: u64,
     pub(crate) message_retention_ms: u64,
     pub(crate) maximum_message_size: usize,
+    pub(crate) receive_wait_time_ms: u64,
+    pub(crate) max_in_flight: usize,
+}
+
+fn validate_receive_options(wait_ms: u64, max_in_flight: usize) -> Result<(), LqsError> {
+    if wait_ms > 20_000 || !(1..=DEFAULT_MAX_IN_FLIGHT).contains(&max_in_flight) {
+        return Err(LqsError::InvalidReceiveOptions);
+    }
+    Ok(())
+}
+
+fn count_in_flight(connection: &Connection, queue: &str, now: i64) -> Result<usize, LqsError> {
+    Ok(connection.query_row("SELECT COUNT(*) FROM messages WHERE queue_name = ?1 AND invisible_until_ms > ?2 AND created_at_ms > ?2 - (SELECT message_retention_ms FROM queues WHERE name = ?1)", params![queue, now], |row| row.get(0))?)
 }
 
 fn validate_delivery_options(delay: u64, retention: u64, maximum: usize) -> Result<(), LqsError> {
