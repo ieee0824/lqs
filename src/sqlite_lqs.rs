@@ -88,6 +88,7 @@ pub enum LqsError {
     QueueAlreadyExists(String),
     QueueNotFound(String),
     InvalidFifoName(String),
+    InvalidStandardName(String),
     FifoRequiresGroupId,
     DeduplicationIdRequired,
     EmptyGroupId,
@@ -102,6 +103,9 @@ impl fmt::Display for LqsError {
             Self::QueueAlreadyExists(name) => write!(f, "queue already exists: {name}"),
             Self::QueueNotFound(name) => write!(f, "queue not found: {name}"),
             Self::InvalidFifoName(name) => write!(f, "FIFO queue name must end with .fifo: {name}"),
+            Self::InvalidStandardName(name) => {
+                write!(f, "Standard queue name must not end with .fifo: {name}")
+            }
             Self::FifoRequiresGroupId => write!(f, "FIFO messages require message_group_id"),
             Self::DeduplicationIdRequired => write!(
                 f,
@@ -190,6 +194,9 @@ impl Lqs {
         let name = name.into();
         if queue_type == QueueType::Fifo && !name.ends_with(".fifo") {
             return Err(LqsError::InvalidFifoName(name));
+        }
+        if queue_type == QueueType::Standard && name.ends_with(".fifo") {
+            return Err(LqsError::InvalidStandardName(name));
         }
         if options.visibility_timeout_ms == 0 {
             return Err(LqsError::InvalidVisibilityTimeout);
@@ -451,6 +458,34 @@ mod tests {
         )
         .unwrap();
         lqs
+    }
+
+    #[test]
+    fn queue_names_must_match_the_queue_type() {
+        let mut lqs = Lqs::new();
+
+        assert_eq!(
+            lqs.create_queue("events", QueueType::Standard, QueueOptions::default()),
+            Ok(())
+        );
+        assert_eq!(
+            lqs.create_queue("orders.fifo", QueueType::Fifo, QueueOptions::default()),
+            Ok(())
+        );
+        assert_eq!(
+            lqs.create_queue("invalid-fifo", QueueType::Fifo, QueueOptions::default()),
+            Err(LqsError::InvalidFifoName("invalid-fifo".to_owned()))
+        );
+        assert_eq!(
+            lqs.create_queue(
+                "invalid-standard.fifo",
+                QueueType::Standard,
+                QueueOptions::default()
+            ),
+            Err(LqsError::InvalidStandardName(
+                "invalid-standard.fifo".to_owned()
+            ))
+        );
     }
 
     #[test]
