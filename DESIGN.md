@@ -27,6 +27,14 @@ SQLite をDB層として使い、キュー定義・メッセージ・FIFO重複�
 
 `receive` はトランザクションで候補の選択と可視性タイムアウトへの遷移を行います。FIFO候補は `NOT EXISTS` により、同一グループの先行メッセージまたはin-flightメッセージがあれば除外します。
 
+## HTTP API
+
+HTTP層は `ServerConfig`、Axumルーター、SQLite-backed `Lqs`を分離しています。CLIは環境変数からサーバー設定を構築してSQLite接続を所有し、ルーターへ渡します。テストでは同じルーターへインメモリDBを注入できます。
+
+`CreateQueue`、`SendMessage`、`ReceiveMessage`、`DeleteMessage`、`ChangeMessageVisibility`を対象とし、AWS JSON 1.0のquery-compatible形式と従来のSQS Query形式を受け付けます。応答形式はリクエストのプロトコルに合わせ、すべての応答へリクエストIDを付与します。AWS署名は受け入れますが検証しません。
+
+サーバーからライブラリAPIへ渡す時刻にはUnix時刻のミリ秒を使い、SQLiteファイルを開き直した後も可視性期限を比較できるようにします。
+
 ## 時刻とテスト容易性
 
 API はホストの時計を直接読まず、呼び出し側から単調増加の `now_ms` を渡します。これにより、可視性タイムアウトと重複排除の境界を sleep なしで決定的にテストできます。実運用用のアダプターでは `Instant` などの単調時計をミリ秒へ変換して渡します。

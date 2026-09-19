@@ -366,7 +366,7 @@ impl Lqs {
         )?)
     }
 
-    fn queue_config(&self, queue_name: &str) -> Result<QueueConfig, LqsError> {
+    pub(crate) fn queue_config(&self, queue_name: &str) -> Result<QueueConfig, LqsError> {
         let row = self.connection.query_row(
             "SELECT queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms FROM queues WHERE name = ?1",
             params![queue_name],
@@ -386,12 +386,12 @@ impl Default for Lqs {
     }
 }
 
-#[derive(Clone, Copy)]
-struct QueueConfig {
-    queue_type: QueueType,
-    visibility_timeout_ms: u64,
-    content_based_deduplication: bool,
-    deduplication_window_ms: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QueueConfig {
+    pub(crate) queue_type: QueueType,
+    pub(crate) visibility_timeout_ms: u64,
+    pub(crate) content_based_deduplication: bool,
+    pub(crate) deduplication_window_ms: u64,
 }
 struct Candidate {
     sequence: i64,
