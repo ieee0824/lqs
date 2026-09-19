@@ -60,7 +60,12 @@ impl Lqs {
         entries: Vec<BatchEntry<SendRequest>>,
         now_ms: u64,
     ) -> Result<BatchResult<SendResult>, LqsError> {
-        validate_batch_size(entries.iter().map(|entry| entry.value.body.len()))?;
+        validate_batch_size(entries.iter().map(|entry| {
+            crate::message_attributes::payload_size(
+                &entry.value.body,
+                &entry.value.message_attributes,
+            )
+        }))?;
         self.run_batch(queue, entries, |lqs, request| {
             lqs.send(queue, request, now_ms)
         })

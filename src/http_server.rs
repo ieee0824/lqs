@@ -25,6 +25,9 @@ use crate::{
 #[path = "batch_http.rs"]
 mod batch_http;
 
+#[path = "attributes_http.rs"]
+mod attributes_http;
+
 #[cfg(test)]
 #[path = "polling_http_tests.rs"]
 mod polling_http_tests;
@@ -391,6 +394,9 @@ impl ApiSuccess {
                 if let Some(sequence_number) = sequence_number {
                     value["SequenceNumber"] = Value::String(sequence_number.clone());
                 }
+                if let Some(digest) = &result.md5_of_message_attributes {
+                    value["MD5OfMessageAttributes"] = json!(digest);
+                }
                 value
             }
             Self::ReceiveMessage { messages } => json!({
@@ -430,10 +436,17 @@ impl ApiSuccess {
                     .as_ref()
                     .map(|value| format!("<SequenceNumber>{}</SequenceNumber>", xml_escape(value)))
                     .unwrap_or_default();
+                let attributes_digest = result
+                    .md5_of_message_attributes
+                    .as_ref()
+                    .map(|digest| {
+                        format!("<MD5OfMessageAttributes>{digest}</MD5OfMessageAttributes>")
+                    })
+                    .unwrap_or_default();
                 (
                     "SendMessage",
                     format!(
-                        "<MD5OfMessageBody>{}</MD5OfMessageBody><MessageId>{}</MessageId>{sequence_number}",
+                        "<MD5OfMessageBody>{}</MD5OfMessageBody><MessageId>{}</MessageId>{sequence_number}{attributes_digest}",
                         md5_hex(body),
                         xml_escape(&result.message_id),
                     ),
@@ -481,21 +494,24 @@ impl ApiSuccess {
 }
 
 fn message_json(message: &ReceivedMessage) -> Value {
-    json!({
+    let mut value = json!({
         "MessageId": message.message_id,
         "ReceiptHandle": message.receipt_handle,
         "MD5OfBody": md5_hex(&message.body),
         "Body": message.body,
-    })
+    });
+    attributes_http::add_json_metadata(&mut value, message);
+    value
 }
 
 fn message_xml(message: &ReceivedMessage) -> String {
     format!(
-        "<Message><MessageId>{}</MessageId><ReceiptHandle>{}</ReceiptHandle><MD5OfBody>{}</MD5OfBody><Body>{}</Body></Message>",
+        "<Message><MessageId>{}</MessageId><ReceiptHandle>{}</ReceiptHandle><MD5OfBody>{}</MD5OfBody><Body>{}</Body>{}</Message>",
         xml_escape(&message.message_id),
         xml_escape(&message.receipt_handle),
         md5_hex(&message.body),
-        xml_escape(&message.body)
+        xml_escape(&message.body),
+        attributes_http::xml_metadata(message)
     )
 }
 
@@ -963,6 +979,7 @@ fn parse_send_request(request: &WireRequest) -> Result<SendRequest, ApiError> {
         .map(str::to_owned);
     Ok(SendRequest {
         body,
+        message_attributes: attributes_http::parse_attributes(request)?,
         message_group_id,
         deduplication_id: request
             .optional_string("MessageDeduplicationId")?
@@ -985,6 +1002,7 @@ async fn receive_message(
 ) -> Result<ApiSuccess, ApiError> {
     let queue_name = queue_name(path, request)?;
     let max_messages = request.unsigned("MaxNumberOfMessages")?.unwrap_or(1);
+    let selection = attributes_http::Selection::parse(request)?;
     if !(1..=10).contains(&max_messages) {
         return Err(ApiError::invalid_parameter(
             "MaxNumberOfMessages",
@@ -1009,7 +1027,10 @@ async fn receive_message(
         let result =
             { lock_lqs(state)?.receive(&queue_name, max_messages as usize, unix_time_ms()) };
         match result {
-            Ok(messages) if !messages.is_empty() => {
+            Ok(mut messages) if !messages.is_empty() => {
+                for message in &mut messages {
+                    selection.apply(message);
+                }
                 return Ok(ApiSuccess::ReceiveMessage { messages });
             }
             Ok(_) => {}

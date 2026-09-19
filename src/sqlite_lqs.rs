@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::Path;
 
+use crate::message_attributes::validate_message_attributes;
+use crate::{MessageAttributes, message_attributes_md5, message_attributes_size};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 #[cfg(test)]
@@ -18,6 +20,10 @@ mod batch_tests;
 #[cfg(test)]
 #[path = "polling_tests.rs"]
 mod polling_tests;
+
+#[cfg(test)]
+#[path = "attribute_tests.rs"]
+mod attribute_tests;
 
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 120_000;
@@ -101,6 +107,7 @@ pub struct SendRequest {
     pub deduplication_id: Option<String>,
     /// Standard-only override; Some(0) disables the queue's default delay.
     pub delay_ms: Option<u64>,
+    pub message_attributes: MessageAttributes,
 }
 
 impl SendRequest {
@@ -110,6 +117,7 @@ impl SendRequest {
             message_group_id: None,
             deduplication_id: None,
             delay_ms: None,
+            message_attributes: MessageAttributes::new(),
         }
     }
     pub fn fifo(body: impl Into<String>, group_id: impl Into<String>) -> Self {
@@ -118,6 +126,7 @@ impl SendRequest {
             message_group_id: Some(group_id.into()),
             deduplication_id: None,
             delay_ms: None,
+            message_attributes: MessageAttributes::new(),
         }
     }
 }
@@ -126,6 +135,7 @@ impl SendRequest {
 pub struct SendResult {
     pub message_id: String,
     pub deduplicated: bool,
+    pub md5_of_message_attributes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +145,8 @@ pub struct ReceivedMessage {
     pub body: String,
     pub message_group_id: Option<String>,
     pub receive_count: u32,
+    pub message_attributes: MessageAttributes,
+    pub system_attributes: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +168,7 @@ pub enum LqsError {
     InvalidReceiveOptions,
     OverLimit,
     MessageNotInflight,
+    InvalidMessageAttributes(String),
     Database(String),
 }
 
@@ -185,6 +198,9 @@ impl fmt::Display for LqsError {
             ),
             Self::OverLimit => write!(f, "in-flight message limit reached"),
             Self::MessageNotInflight => write!(f, "message is no longer in flight"),
+            Self::InvalidMessageAttributes(reason) => {
+                write!(f, "invalid message attributes: {reason}")
+            }
             Self::InvalidBatch(code) => write!(f, "invalid batch request: {code}"),
             Self::InvalidMessageIdentifier(name) => write!(
                 f,
@@ -196,7 +212,7 @@ impl fmt::Display for LqsError {
             }
             Self::InvalidMessageSize { size, maximum } => write!(
                 f,
-                "message body is {size} bytes; must be 1..={maximum} bytes"
+                "message including attributes is {size} bytes; body must be nonempty and total must not exceed {maximum} bytes"
             ),
         }
     }
@@ -294,6 +310,18 @@ impl Lqs {
             ),
             ("messages", "available_at_ms", "INTEGER NOT NULL DEFAULT 0"),
             (
+                "messages",
+                "message_attributes",
+                "TEXT NOT NULL DEFAULT '{}'",
+            ),
+            ("messages", "first_received_at_ms", "INTEGER"),
+            ("messages", "message_deduplication_id", "TEXT"),
+            (
+                "messages",
+                "total_receive_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
                 "queues",
                 "receive_wait_time_ms",
                 "INTEGER NOT NULL DEFAULT 0 CHECK(receive_wait_time_ms BETWEEN 0 AND 20000)",
@@ -312,6 +340,15 @@ impl Lqs {
                 transaction.execute_batch(&format!(
                     "ALTER TABLE {table} ADD COLUMN {column} {definition}"
                 ))?;
+                if column == "message_deduplication_id" {
+                    transaction.execute("UPDATE messages SET message_deduplication_id = (SELECT deduplication_id FROM deduplication_keys WHERE deduplication_keys.queue_name = messages.queue_name AND deduplication_keys.message_id = messages.message_id LIMIT 1)", [])?;
+                }
+                if column == "total_receive_count" {
+                    transaction.execute(
+                        "UPDATE messages SET total_receive_count = receive_count",
+                        [],
+                    )?;
+                }
             }
         }
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_created ON messages(queue_name, created_at_ms)")?;
@@ -378,13 +415,31 @@ impl Lqs {
             message_group_id,
             deduplication_id,
             delay_ms,
+            mut message_attributes,
         } = request;
-        if body.is_empty() || body.len() > config.maximum_message_size {
+        let size = body
+            .len()
+            .saturating_add(message_attributes_size(&message_attributes));
+        if body.is_empty() || size > config.maximum_message_size {
             return Err(LqsError::InvalidMessageSize {
-                size: body.len(),
+                size,
                 maximum: config.maximum_message_size,
             });
         }
+        validate_message_attributes(&mut message_attributes)?;
+        // Normalizing a Number can expand exponent notation; validate the stored size too.
+        let normalized_size = body
+            .len()
+            .saturating_add(message_attributes_size(&message_attributes));
+        if normalized_size > config.maximum_message_size {
+            return Err(LqsError::InvalidMessageSize {
+                size: normalized_size,
+                maximum: config.maximum_message_size,
+            });
+        }
+        let attribute_md5 = message_attributes_md5(&message_attributes);
+        let attributes_json = serde_json::to_string(&message_attributes)
+            .map_err(|error| LqsError::Database(error.to_string()))?;
         if let Some(delay) = delay_ms
             && (config.queue_type == QueueType::Fifo || delay > 900_000)
         {
@@ -431,15 +486,15 @@ impl Lqs {
                 params![queue_name, key], |row| row.get(0),
             ).optional()? {
                 transaction.commit()?;
-                return Ok(SendResult { message_id, deduplicated: true });
+                return Ok(SendResult { message_id, deduplicated: true, md5_of_message_attributes: attribute_md5 });
             }
             Some(key)
         } else {
             None
         };
         transaction.execute(
-            "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms, available_at_ms) VALUES (NULL, ?1, ?2, ?3, ?4, ?5)",
-            params![queue_name, body, group_id, ms(now_ms), ms(now_ms).saturating_add(ms(delay_ms.unwrap_or(config.delay_ms)))],
+            "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms, available_at_ms, message_attributes, message_deduplication_id) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![queue_name, body, group_id, ms(now_ms), ms(now_ms).saturating_add(ms(delay_ms.unwrap_or(config.delay_ms))), attributes_json, deduplication_id],
         )?;
         let sequence = transaction.last_insert_rowid();
         let message_id = format!("msg-{sequence:016x}");
@@ -457,6 +512,7 @@ impl Lqs {
         Ok(SendResult {
             message_id,
             deduplicated: false,
+            md5_of_message_attributes: attribute_md5,
         })
     }
 
@@ -516,15 +572,19 @@ impl Lqs {
                 candidate.sequence
             );
             transaction.execute(
-                "UPDATE messages SET receipt_handle = ?1, invisible_until_ms = ?2, receive_count = ?3 WHERE sequence = ?4",
-                params![receipt_handle, now.saturating_add(ms(config.visibility_timeout_ms)), receive_count, candidate.sequence],
+                "UPDATE messages SET receipt_handle = ?1, invisible_until_ms = ?2, receive_count = ?3, total_receive_count = total_receive_count + 1, first_received_at_ms = COALESCE(first_received_at_ms, ?5) WHERE sequence = ?4",
+                params![receipt_handle, now.saturating_add(ms(config.visibility_timeout_ms)), receive_count, candidate.sequence, now],
             )?;
+            let (message_attributes, system_attributes) =
+                read_message_metadata(&transaction, candidate.sequence, config.queue_type)?;
             received.push(ReceivedMessage {
                 message_id: candidate.message_id,
                 receipt_handle,
                 body: candidate.body,
                 message_group_id: candidate.group_id,
                 receive_count: receive_count as u32,
+                message_attributes,
+                system_attributes,
             });
         }
         transaction.commit()?;
@@ -842,11 +902,11 @@ fn move_message(
     reset_timestamp: bool,
     new_identity: bool,
 ) -> Result<i64, LqsError> {
-    let (message_id, body, group_id, created_at): (String, String, Option<String>, i64) =
+    let StoredMessage { message_id, body, group_id, created_at, attributes, first_received, dedup, total_count } =
         transaction.query_row(
-            "SELECT message_id, body, group_id, created_at_ms FROM messages WHERE sequence = ?1",
+            "SELECT message_id, body, group_id, created_at_ms, message_attributes, first_received_at_ms, message_deduplication_id, total_receive_count FROM messages WHERE sequence = ?1",
             [sequence],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok(StoredMessage { message_id: row.get(0)?, body: row.get(1)?, group_id: row.get(2)?, created_at: row.get(3)?, attributes: row.get(4)?, first_received: row.get(5)?, dedup: row.get(6)?, total_count: row.get(7)? }),
         )?;
     transaction.execute("DELETE FROM messages WHERE sequence = ?1", [sequence])?;
     let delay = if new_identity {
@@ -855,8 +915,8 @@ fn move_message(
         0
     };
     transaction.execute(
-        "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms, available_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![if new_identity { None } else { Some(message_id) }, destination, body, group_id, if reset_timestamp { now } else { created_at }, now.saturating_add(ms(delay))],
+        "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms, available_at_ms, message_attributes, first_received_at_ms, message_deduplication_id, total_receive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![if new_identity { None } else { Some(message_id) }, destination, body, group_id, if reset_timestamp { now } else { created_at }, now.saturating_add(ms(delay)), attributes, if new_identity { None } else { first_received }, dedup, if new_identity { 0 } else { total_count }],
     )?;
     let moved = transaction.last_insert_rowid();
     if new_identity {
@@ -867,6 +927,17 @@ fn move_message(
     }
     Ok(moved)
 }
+struct StoredMessage {
+    message_id: String,
+    body: String,
+    group_id: Option<String>,
+    created_at: i64,
+    attributes: String,
+    first_received: Option<i64>,
+    dedup: Option<String>,
+    total_count: i64,
+}
+
 struct Candidate {
     sequence: i64,
     message_id: String,
@@ -905,6 +976,58 @@ fn next_receivable(
 
 fn ms(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
+}
+
+fn read_message_metadata(
+    connection: &Connection,
+    sequence: i64,
+    kind: QueueType,
+) -> Result<
+    (
+        MessageAttributes,
+        std::collections::BTreeMap<String, String>,
+    ),
+    LqsError,
+> {
+    let (encoded, sent, first, count, group, dedup, id): (String, i64, i64, i64, Option<String>, Option<String>, String) = connection.query_row(
+        "SELECT message_attributes, created_at_ms, first_received_at_ms, total_receive_count, group_id, message_deduplication_id, message_id FROM messages WHERE sequence = ?1",
+        [sequence], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)))?;
+    let attributes =
+        serde_json::from_str(&encoded).map_err(|error| LqsError::Database(error.to_string()))?;
+    let mut system = std::collections::BTreeMap::from([
+        ("SentTimestamp".into(), sent.to_string()),
+        ("ApproximateFirstReceiveTimestamp".into(), first.to_string()),
+        ("ApproximateReceiveCount".into(), count.to_string()),
+        ("SenderId".into(), "000000000000".into()),
+        ("SqsManagedSseEnabled".into(), "false".into()),
+    ]);
+    if let Some(group) = group {
+        system.insert("MessageGroupId".into(), group);
+    }
+    if kind == QueueType::Fifo {
+        let number = id
+            .strip_prefix("msg-")
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .unwrap_or(sequence as u64);
+        system.insert("SequenceNumber".into(), number.to_string());
+        if let Some(dedup) = dedup {
+            system.insert("MessageDeduplicationId".into(), dedup);
+        }
+    }
+    let source: Option<String> = connection
+        .query_row(
+            "SELECT source_queue FROM dead_letter_origins WHERE sequence = ?1",
+            [sequence],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(source) = source {
+        system.insert(
+            "DeadLetterQueueSourceArn".into(),
+            format!("arn:aws:sqs:us-east-1:000000000000:{source}"),
+        );
+    }
+    Ok((attributes, system))
 }
 fn stable_content_id(body: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;

@@ -43,7 +43,7 @@ HTTP層は `ServerConfig`、Axumルーター、SQLite-backed `Lqs`を分離し�
 
 HTTPはバッチ処理中に同一サーバーのMutexを保持し、他のHTTP操作がエントリー間に割り込みません。別プロセス・接続を含むバッチ全体の隔離は保証しません。JSONの`Entries`は配列順、Queryの`<Action>RequestEntry.N`はNの数値順で処理するため、10番目が2番目より先に入ることはありません。エントリーIDは応答との対応付け専用で、メッセージIDやFIFO重複排除キーとは独立です。
 
-JSONでは`Successful`/`Failed`、Queryでは`<Action>ResultEntry`/`BatchResultErrorEntry`を返します。送信成功には本文MD5とMessageId、FIFOにはSequenceNumberを含めます。単体送信とバッチ送信でFIFOの順序・重複排除ロジックを共有します。メッセージ属性と属性分のサイズ計算は#7の範囲です。
+JSONでは`Successful`/`Failed`、Queryでは`<Action>ResultEntry`/`BatchResultErrorEntry`を返します。送信成功には本文MD5とMessageId、FIFOにはSequenceNumber、属性指定時には属性MD5を含めます。単体送信とバッチ送信でFIFOの順序・重複排除ロジックを共有します。バッチの合計サイズにも属性を含め、書き込み前に検証します。
 
 仕様参照: [SendMessageBatch](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html)、[DeleteMessageBatch](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessageBatch.html)、[ChangeMessageVisibilityBatch](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibilityBatch.html)。
 
@@ -65,9 +65,23 @@ HTTPはJSON/Query双方でRedrivePolicyのCreate/Set/GetとListDeadLetterSourceQ
 
 送受信はImmediateトランザクション内で最新設定を読み、`created_at_ms + message_retention_ms <= now_ms`の行を先に削除します。期限切れのFIFO先行メッセージは後続を妨げず、期限切れメッセージをDLQへ送ることもありません。StandardのDLQ移動は元送信時刻を保持するため、DLQ側の保持期限で判定します。FIFO移動は移動時刻から数えます。再投入前にも期限を確認し、有効なメッセージだけ新しい送信時刻と対象キューの遅延で再登録します。FIFOの重複排除ウィンドウはメッセージ保持期限とは独立です。
 
-本文はUTF-8バイト数で1〜キューの設定上限を検証し、重複排除より先に不正サイズを拒否します。HTTP全体の上限は8 MiBとして、1 MiB本文のJSON（最大6倍）・Query（最大3倍）エンコードを許容します。メッセージ属性を含むサイズ計算は属性実装（#7）の範囲です。
+本文は1バイト以上を必須とし、UTF-8本文と属性名・型名・属性値の合計がキューの設定上限以下か検証します。Binary属性は生バイト数で計算します。重複排除より先に属性とサイズを検証します。HTTP全体の上限は8 MiBとして、1 MiBメッセージのJSON・Queryエンコードの増加を許容します。
 
 複数の配信属性とRedrivePolicyの変更は原子的に処理します。保持期間変更は既存メッセージにも即時適用します。FIFOの遅延変更は未受信メッセージへ遡及し、受信済みメッセージの可視性期限は変更しません。Standardの既存メッセージは変更しません。AWSの非同期設定伝播は再現せず、決定的なローカルテストのため即時反映とします。
+
+## メッセージ属性の永続化・選択・MD5
+
+`messages.message_attributes`に型付きマップをJSON保存します。論理型とカスタム接尾辞を`data_type`、文字列またはバイナリをenumで区別するため、Binaryが文字列へ変わることはありません。HTTPのBase64変換は境界だけで行います。属性名は予約接頭辞・文字種・長さ・ピリオド制約を検証し、最大10個・非空値・型との整合性を強制します。Numberは浮動小数点を使わず38桁精度と範囲を検証・正規化し、指数表記の展開後を含め大きい方のサイズで上限を確認します。
+
+初回受信時刻、保存された重複排除ID、累計受信回数を別列で保持します。初回時刻のCOALESCE更新と回数加算は受信トランザクション内です。既存DBでは属性は空、累計回数は既存の受信回数から初期化し、重複排除IDは残存するキーから復元します。過去の初回受信時刻は推測せず移行後の最初の受信で記録します。
+
+自動DLQ移動は属性・初回時刻・累計回数を引き継ぎます。従来の`receive_count`はキュー内のDLQ判定用としてリセットし、システム属性`ApproximateReceiveCount`は別の累計列から返します。手動再投入は新規ID・送信時刻・初回時刻・回数にし、ユーザー属性を保持します。SequenceNumberはMessageIdに対応する採番値で、再受信や自動移動で変えず、新規IDになる再投入で更新します。
+
+同期ライブラリは全メタデータを返し、HTTP層が`MessageAttributeNames`と`MessageSystemAttributeNames`（旧`AttributeNames`も併用可）で絞ります。指定なしは属性なし、ユーザー属性は完全名・All・ワイルドカードによる前方一致、システム属性は列挙名・Allです。選択は返却データだけに適用し、DBの属性を削除しません。
+
+MD5は属性名昇順に名前・型名・値のUTF-8/生バイトを4バイト長付きbig-endianで連結し、値の前に文字列/Number=1、Binary=2の1バイトを置きます。カスタム型名全体を含め、受信時には選択結果の属性集合で再計算します。FIFOの本文ベース重複排除には属性を使わず、既存LQSの安定ハッシュと重複排除ウィンドウを維持します。
+
+仕様参照: [メッセージメタデータ](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-message-metadata.html)、[MessageAttributeValue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_MessageAttributeValue.html)。
 
 ## ロングポーリングとin-flight管理
 
