@@ -628,7 +628,23 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
         QueueType::Standard
     };
     let delivery = delivery_attributes(&attributes)?;
+    if !fifo
+        && [
+            "DeduplicationScope",
+            "FifoThroughputLimit",
+            "ContentBasedDeduplication",
+        ]
+        .iter()
+        .any(|key| attributes.contains_key(*key))
+    {
+        return Err(ApiError::invalid_parameter(
+            "Attributes",
+            "FIFO attributes require a FIFO queue",
+        ));
+    }
     let options = QueueOptions {
+        deduplication_scope: delivery.deduplication_scope.unwrap_or_default(),
+        fifo_throughput_limit: delivery.fifo_throughput_limit.unwrap_or_default(),
         visibility_timeout_ms,
         content_based_deduplication,
         redrive_policy: delivery.redrive_policy.flatten(),
@@ -662,6 +678,8 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
                         && existing.maximum_message_size == options.maximum_message_size
                         && existing.receive_wait_time_ms == options.receive_wait_time_ms
                         && existing.max_in_flight == options.max_in_flight
+                        && existing.deduplication_scope == options.deduplication_scope
+                        && existing.fifo_throughput_limit == options.fifo_throughput_limit
                 })
                 .unwrap_or(false);
         if !same_configuration {
@@ -710,6 +728,15 @@ fn parse_redrive_policy(value: &str) -> Result<Option<RedrivePolicy>, ApiError> 
 
 fn delivery_attributes(attributes: &HashMap<String, String>) -> Result<QueueUpdate, ApiError> {
     Ok(QueueUpdate {
+        content_based_deduplication: parse_bool_attribute(attributes, "ContentBasedDeduplication")?,
+        deduplication_scope: attributes
+            .get("DeduplicationScope")
+            .map(|value| value.parse())
+            .transpose()?,
+        fifo_throughput_limit: attributes
+            .get("FifoThroughputLimit")
+            .map(|value| value.parse())
+            .transpose()?,
         receive_wait_time_ms: attributes
             .get("ReceiveMessageWaitTimeSeconds")
             .map(|value| {
@@ -765,6 +792,9 @@ fn set_queue_attributes(
         || attributes.keys().any(|name| {
             ![
                 "RedrivePolicy",
+                "ContentBasedDeduplication",
+                "DeduplicationScope",
+                "FifoThroughputLimit",
                 "DelaySeconds",
                 "MessageRetentionPeriod",
                 "MaximumMessageSize",
@@ -777,7 +807,7 @@ fn set_queue_attributes(
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "InvalidAttributeName",
-            "supported attributes: RedrivePolicy, DelaySeconds, MessageRetentionPeriod, MaximumMessageSize, ReceiveMessageWaitTimeSeconds, LqsMaxInFlightMessages",
+            "unsupported queue attribute",
         ));
     }
     let update = delivery_attributes(&attributes)?;
@@ -858,6 +888,14 @@ fn get_queue_attributes(
     if config.queue_type == QueueType::Fifo {
         attributes.insert("FifoQueue".into(), "true".into());
         attributes.insert(
+            "DeduplicationScope".into(),
+            config.deduplication_scope.as_str().into(),
+        );
+        attributes.insert(
+            "FifoThroughputLimit".into(),
+            config.fifo_throughput_limit.as_str().into(),
+        );
+        attributes.insert(
             "ContentBasedDeduplication".into(),
             config.content_based_deduplication.to_string(),
         );
@@ -878,6 +916,8 @@ fn get_queue_attributes(
             "QueueArn",
             "VisibilityTimeout",
             "FifoQueue",
+            "DeduplicationScope",
+            "FifoThroughputLimit",
             "ContentBasedDeduplication",
             "RedrivePolicy",
             "DelaySeconds",
@@ -1003,6 +1043,19 @@ async fn receive_message(
     let queue_name = queue_name(path, request)?;
     let max_messages = request.unsigned("MaxNumberOfMessages")?.unwrap_or(1);
     let selection = attributes_http::Selection::parse(request)?;
+    let visibility = request.unsigned("VisibilityTimeout")?;
+    if visibility.is_some_and(|seconds| seconds > 43_200) {
+        return Err(ApiError::invalid_parameter(
+            "VisibilityTimeout",
+            "must be between 0 and 43200",
+        ));
+    }
+    let options = crate::ReceiveOptions {
+        receive_request_attempt_id: request
+            .optional_string("ReceiveRequestAttemptId")?
+            .map(str::to_owned),
+        visibility_timeout_ms: visibility.map(|seconds| seconds * 1000),
+    };
     if !(1..=10).contains(&max_messages) {
         return Err(ApiError::invalid_parameter(
             "MaxNumberOfMessages",
@@ -1024,24 +1077,35 @@ async fn receive_message(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
     loop {
         // Neither the Mutex nor the SQLite transaction lives across the await below.
-        let result =
-            { lock_lqs(state)?.receive(&queue_name, max_messages as usize, unix_time_ms()) };
+        let result = {
+            lock_lqs(state)?.receive_page(
+                &queue_name,
+                max_messages as usize,
+                &options,
+                unix_time_ms(),
+                tokio::time::Instant::now() >= deadline,
+            )
+        };
         match result {
-            Ok(mut messages) if !messages.is_empty() => {
+            Ok((mut messages, true)) => {
                 for message in &mut messages {
                     selection.apply(message);
                 }
                 return Ok(ApiSuccess::ReceiveMessage { messages });
             }
-            Ok(_) => {}
-            Err(LqsError::OverLimit) if wait_ms > 0 => {}
+            Ok((_, false)) => {}
+            Err(LqsError::OverLimit) if wait_ms > 0 => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(ApiSuccess::ReceiveMessage {
+                        messages: Vec::new(),
+                    });
+                }
+            }
             Err(error) => return Err(error.into()),
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Ok(ApiSuccess::ReceiveMessage {
-                messages: Vec::new(),
-            });
+            continue;
         }
         // Also detects time-driven availability and writes from other DB connections.
         tokio::time::sleep_until(deadline.min(now + std::time::Duration::from_millis(100))).await;

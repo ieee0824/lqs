@@ -85,7 +85,7 @@ fn dlq_retention_uses_standard_original_time_and_fifo_transfer_time() {
             source,
             kind,
             QueueOptions {
-                content_based_deduplication: true,
+                content_based_deduplication: kind == QueueType::Fifo,
                 message_retention_ms: 120_000,
                 redrive_policy: Some(RedrivePolicy {
                     dead_letter_queue: dead.into(),
@@ -226,7 +226,7 @@ fn expiration_covers_available_delayed_and_inflight_and_unblocks_fifo() {
             kind,
             QueueOptions {
                 delay_ms: delay,
-                content_based_deduplication: true,
+                content_based_deduplication: kind == QueueType::Fifo,
                 ..options()
             },
         )
@@ -300,7 +300,7 @@ fn settings_updates_are_atomic_and_fifo_delay_is_retroactive() {
             name,
             kind,
             QueueOptions {
-                content_based_deduplication: true,
+                content_based_deduplication: kind == QueueType::Fifo,
                 ..options()
             },
         )

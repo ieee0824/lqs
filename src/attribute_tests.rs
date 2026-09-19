@@ -188,7 +188,7 @@ fn dlq_and_redrive_preserve_attributes_and_track_system_metadata() {
             kind,
             QueueOptions {
                 visibility_timeout_ms: 10,
-                content_based_deduplication: true,
+                content_based_deduplication: kind == QueueType::Fifo,
                 redrive_policy: Some(RedrivePolicy {
                     dead_letter_queue: dlq.into(),
                     max_receive_count: 1,

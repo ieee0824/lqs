@@ -20,7 +20,7 @@ fn inflight_capacity_is_atomic_and_queue_scoped_for_both_types() {
             kind,
             QueueOptions {
                 max_in_flight: 2,
-                content_based_deduplication: true,
+                content_based_deduplication: kind == QueueType::Fifo,
                 ..QueueOptions::default()
             },
         )
