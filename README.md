@@ -101,7 +101,7 @@ HTTPの`ReceiveMessage`では、要求された属性だけを返します。指
 
 本文と属性はSQLiteに保存され、再起動・再受信・DLQ転送でも保持されます。初回受信時刻は再受信で変わりません。`ApproximateReceiveCount`はDLQ転送をまたいで累計し、手動再投入では新規メッセージとして時刻・回数をリセットします。既存DBの過去の初回受信時刻は復元できないため、移行後の最初の受信時刻になります。
 
-属性サイズは名前・型名（接尾辞込み）・値を合算し、単体上限とバッチ合計上限の両方に含めます。属性MD5は送信応答と、選択された受信属性に対して返します。FIFOの本文ベース重複排除は属性を含めず、本文が同じなら属性が異なっても重複扱いとなり、元の属性は上書きしません。生成する重複排除IDには従来のLQS独自の安定ハッシュを使用します。
+属性サイズは名前・型名（接尾辞込み）・値を合算し、単体上限とバッチ合計上限の両方に含めます。属性MD5は送信応答と、選択された受信属性に対して返します。FIFOの本文ベース重複排除は属性を含めず、本文が同じなら属性が異なっても重複扱いとなり、元の属性は上書きしません。生成する重複排除IDには本文のUTF-8バイト列のSHA-256（小文字16進数）を使用します。
 
 署名を検証しないローカルサービスのため`SenderId`は`000000000000`、暗号化状態は`false`固定です。X-Rayの`AWSTraceHeader`送信や属性のリスト値は未対応です。
 
@@ -119,6 +119,28 @@ in-flight上限はキューごとに既定120,000件です。ローカル検証�
 | ロングポーリング | 空きができるまで待機、期限到達で空結果 | 同左 |
 
 削除、可視性期限の終了・0への変更、保持期限で空きが戻ります。`GetQueueAttributes`の`ApproximateNumberOfMessagesNotVisible`とRustの`in_flight_count(queue, now_ms)`で現在の件数を取得できます。上限を現在の件数より小さくしても受信済みメッセージは取り消さず、件数が下がるまで新規受信を止めます。可視性期限切れのハンドルでの延長は`MessageNotInflight`になります。
+
+## FIFO の重複排除と受信再試行
+
+送信の重複排除期間は最初の送信から固定5分です。再送で期間は延長せず、メッセージを削除してもキーは期間中保持します。明示的な`MessageDeduplicationId`は本文ハッシュより優先され、生成済みハッシュと同じIDなら同じ重複排除キーになります。Rustの既存フィールド`deduplication_window_ms`には300,000以外を指定できません。
+
+`CreateQueue` / `SetQueueAttributes` / `GetQueueAttributes`で次のFIFO専用属性を扱えます。
+
+| 属性 | 値 | 既定値 |
+| --- | --- | --- |
+| `ContentBasedDeduplication` | `true` / `false` | `false` |
+| `DeduplicationScope` | `queue` / `messageGroup` | `queue` |
+| `FifoThroughputLimit` | `perQueue` / `perMessageGroupId` | `perQueue` |
+
+`perMessageGroupId`には`messageGroup`が必須です。設定の組み合わせは更新後の値で検証し、不正なら全属性を変更しません。`messageGroup`では同じ重複排除IDでもグループが異なれば別メッセージとして受理します。LQSは設定と重複排除範囲をモデル化しますが、AWSのリージョン別TPS制限・パーティション分散は再現しません。
+
+FIFOの`ReceiveMessage.ReceiveRequestAttemptId`には1〜128文字のASCII英数字・記号を指定できます。同じIDの再試行は初回応答から5分間、同じメッセージ・receipt handle・受信回数を返し、可視性期限をリセットします。受信結果はSQLiteに保存するため再起動・別接続でも有効です。空の応答も保存し、ロングポーリングの空応答は待機終了時に確定します。初回受信で使った`MaxNumberOfMessages`と`VisibilityTimeout`（省略を含む）は再試行でも同じ指定にしてください。
+
+対象の一部でも削除・可視性変更・別リクエストでの再受信・DLQ転送・保持期限切れが起きた場合、LQSはそのIDの再試行を`InvalidParameterValue`で拒否します。期限切れ後は同じIDを新しい受信として扱います。`VisibilityTimeout`は受信単位に0〜43,200秒で指定できます。Rustでは`receive_with_options`と`ReceiveOptions`を使用します。受信済み結果の再試行はin-flight上限到達時も可能ですが、可視性が切れたメッセージを再びin-flightにする際にローカル上限を超える場合は`OverLimit`です。
+
+既存DBは自動移行し、メッセージ・明示的な重複排除キーを保持します。旧設定の重複排除窓は5分へ統一します。旧FNVハッシュを使う履歴は明示IDと区別できないためSHA-256へ書き換えません。アップグレードをまたぐ本文ベースの再送は重複排除されない可能性があるため、送信を5分以上停止してから切り替えるか、明示IDを利用してください。旧履歴で削除済みメッセージのグループが不明なキーは、残りの有効期間だけ全グループに適用します。
+
+仕様参考: [FIFOの重複排除](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html)、[FIFO属性](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html)、[ReceiveMessage](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html)。
 
 ## テスト
 

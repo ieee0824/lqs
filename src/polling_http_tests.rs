@@ -55,6 +55,45 @@ async fn waiting_receive_releases_lock_and_returns_on_arrival() {
 }
 
 #[tokio::test]
+async fn competing_fifo_attempt_waiters_share_the_completed_response() {
+    let mut lqs = Lqs::new();
+    lqs.create_queue(
+        "q.fifo",
+        QueueType::Fifo,
+        QueueOptions {
+            content_based_deduplication: true,
+            ..QueueOptions::default()
+        },
+    )
+    .unwrap();
+    let app = router(lqs, "http://localhost");
+    let request =
+        json!({"QueueUrl":"/q.fifo", "WaitTimeSeconds":2, "ReceiveRequestAttemptId":"shared"});
+    let a = tokio::spawn(call(app.clone(), "ReceiveMessage", request.clone()));
+    let b = tokio::spawn(call(app.clone(), "ReceiveMessage", request));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!a.is_finished() && !b.is_finished());
+    let (status, _) = call(
+        app.clone(),
+        "SendMessage",
+        json!({"QueueUrl":"/q.fifo", "MessageBody":"arrived", "MessageGroupId":"g"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let a = tokio::time::timeout(Duration::from_secs(1), a)
+        .await
+        .unwrap()
+        .unwrap();
+    let b = tokio::time::timeout(Duration::from_secs(1), b)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(a, b);
+    assert_eq!(a.1["Messages"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn empty_long_poll_waits_until_its_original_deadline() {
     let app = test_app(QueueOptions {
         receive_wait_time_ms: 1000,
