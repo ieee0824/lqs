@@ -31,6 +31,10 @@ mod attributes_http;
 #[path = "management_http.rs"]
 mod management_http;
 
+#[path = "security_http.rs"]
+mod security_http;
+pub use security_http::{AuthorizationHook, HttpAuthorizationRequest};
+
 #[cfg(test)]
 #[path = "polling_http_tests.rs"]
 mod polling_http_tests;
@@ -42,6 +46,7 @@ const MAX_REQUEST_BYTES: usize = 8 * 1_048_576;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub trust_principal_header: bool,
     pub bind_addr: SocketAddr,
     pub database_path: PathBuf,
     pub public_base_url: String,
@@ -64,6 +69,11 @@ impl ServerConfig {
             return Err(ServerConfigError::InvalidBaseUrl(public_base_url));
         }
         Ok(Self {
+            trust_principal_header: match env::var("LQS_TRUST_PRINCIPAL_HEADER").as_deref() {
+                Ok("true") => true,
+                Ok("false") | Err(env::VarError::NotPresent) => false,
+                _ => return Err(ServerConfigError::InvalidAuthorizationMode),
+            },
             bind_addr,
             database_path,
             public_base_url,
@@ -73,6 +83,7 @@ impl ServerConfig {
 
 #[derive(Debug)]
 pub enum ServerConfigError {
+    InvalidAuthorizationMode,
     InvalidBindAddress(String),
     InvalidBaseUrl(String),
 }
@@ -80,6 +91,10 @@ pub enum ServerConfigError {
 impl fmt::Display for ServerConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidAuthorizationMode => write!(
+                formatter,
+                "LQS_TRUST_PRINCIPAL_HEADER must be true or false"
+            ),
             Self::InvalidBindAddress(message) => {
                 write!(formatter, "invalid LQS_BIND_ADDR: {message}")
             }
@@ -121,6 +136,8 @@ impl From<std::io::Error> for ServerError {
 
 #[derive(Clone)]
 struct AppState {
+    authorization_hook: Arc<AuthorizationHook>,
+    access: Option<security_http::AccessContext>,
     lqs: Arc<Mutex<Lqs>>,
     public_base_url: Arc<str>,
     request_sequence: Arc<AtomicU64>,
@@ -136,7 +153,16 @@ impl AppState {
 pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let lqs = Lqs::open(&config.database_path)?;
     let listener = TcpListener::bind(config.bind_addr).await?;
-    serve_with_listener(listener, lqs, config.public_base_url).await
+    axum::serve(
+        listener,
+        router_with_authorization(
+            lqs,
+            config.public_base_url,
+            security_http::local_hook(config.trust_principal_header),
+        ),
+    )
+    .await
+    .map_err(ServerError::Io)
 }
 
 pub async fn serve_with_listener(
@@ -150,7 +176,17 @@ pub async fn serve_with_listener(
 }
 
 pub fn router(lqs: Lqs, public_base_url: impl Into<String>) -> Router {
+    router_with_authorization(lqs, public_base_url, security_http::local_hook(false))
+}
+
+pub fn router_with_authorization(
+    lqs: Lqs,
+    public_base_url: impl Into<String>,
+    authorization_hook: Arc<AuthorizationHook>,
+) -> Router {
     let state = AppState {
+        authorization_hook,
+        access: None,
         lqs: Arc::new(Mutex::new(lqs)),
         public_base_url: Arc::from(public_base_url.into().trim_end_matches('/').to_owned()),
         request_sequence: Arc::new(AtomicU64::new(1)),
@@ -161,7 +197,7 @@ pub fn router(lqs: Lqs, public_base_url: impl Into<String>) -> Router {
         .with_state(state)
 }
 
-async fn handle_request(State(state): State<AppState>, request: Request) -> Response {
+async fn handle_request(State(mut state): State<AppState>, request: Request) -> Response {
     let request_id = state.next_request_id();
     if request.method() != Method::POST {
         return ApiError::new(
@@ -173,6 +209,7 @@ async fn handle_request(State(state): State<AppState>, request: Request) -> Resp
     }
 
     let path = request.uri().path().to_owned();
+    let uri = request.uri().clone();
     let headers = request.headers().clone();
     let body = match to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
         Ok(body) => body,
@@ -185,13 +222,17 @@ async fn handle_request(State(state): State<AppState>, request: Request) -> Resp
             .into_response(protocol_from_headers(&headers), &request_id);
         }
     };
-    let wire_request = match WireRequest::parse(&headers, body) {
+    let wire_request = match WireRequest::parse(&headers, body.clone()) {
         Ok(request) => request,
         Err(error) => {
             return error.into_response(protocol_from_headers(&headers), &request_id);
         }
     };
     let protocol = wire_request.protocol;
+    match security_http::access_context(&state, &path, &wire_request, headers, uri, body) {
+        Ok(access) => state.access = Some(access),
+        Err(error) => return error.into_response(protocol, &request_id),
+    }
     let result = if wire_request.action == "ReceiveMessage" {
         receive_message(&state, &path, &wire_request).await
     } else {
@@ -619,6 +660,7 @@ impl ApiError {
 
 fn dispatch(state: &AppState, path: &str, request: WireRequest) -> Result<ApiSuccess, ApiError> {
     match request.action.as_str() {
+        "AddPermission" | "RemovePermission" => security_http::permission(state, path, &request),
         "ListQueues" | "GetQueueUrl" | "DeleteQueue" | "PurgeQueue" | "TagQueue" | "UntagQueue"
         | "ListQueueTags" => management_http::execute(state, path, &request),
         "SendMessageBatch" | "DeleteMessageBatch" | "ChangeMessageVisibilityBatch" => {
@@ -681,6 +723,7 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
         ));
     }
     let options = QueueOptions {
+        security: crate::QueueSecurity::default().updated(&delivery.security)?,
         deduplication_scope: delivery.deduplication_scope.unwrap_or_default(),
         fifo_throughput_limit: delivery.fifo_throughput_limit.unwrap_or_default(),
         visibility_timeout_ms,
@@ -720,6 +763,7 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
                         && existing.max_in_flight == options.max_in_flight
                         && existing.deduplication_scope == options.deduplication_scope
                         && existing.fifo_throughput_limit == options.fifo_throughput_limit
+                        && existing.security == options.security
                 })
                 .unwrap_or(false);
         if !same_configuration {
@@ -768,6 +812,7 @@ fn parse_redrive_policy(value: &str) -> Result<Option<RedrivePolicy>, ApiError> 
 
 fn delivery_attributes(attributes: &HashMap<String, String>) -> Result<QueueUpdate, ApiError> {
     Ok(QueueUpdate {
+        security: security_http::parse_update(attributes)?,
         visibility_timeout_ms: attributes
             .get("VisibilityTimeout")
             .map(|value| {
@@ -935,6 +980,7 @@ fn get_queue_attributes(
             (config.visibility_timeout_ms / 1000).to_string(),
         ),
     ]);
+    security_http::add_attributes(&mut attributes, &config.security);
     if config.queue_type == QueueType::Fifo {
         attributes.insert("FifoQueue".into(), "true".into());
         attributes.insert(
@@ -980,6 +1026,10 @@ fn get_queue_attributes(
             "ApproximateNumberOfMessagesDelayed",
             "CreatedTimestamp",
             "LastModifiedTimestamp",
+            "Policy",
+            "SqsManagedSseEnabled",
+            "KmsMasterKeyId",
+            "KmsDataKeyReusePeriodSeconds",
         ]
         .contains(name)
         {
@@ -1260,17 +1310,22 @@ fn parse_seconds(name: &str, value: &str, minimum: u64, maximum: u64) -> Result<
 }
 
 fn lock_lqs(state: &AppState) -> Result<std::sync::MutexGuard<'_, Lqs>, ApiError> {
-    state.lqs.lock().map_err(|_| {
+    let guard = state.lqs.lock().map_err(|_| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalError",
             "queue database lock is poisoned",
         )
-    })
+    })?;
+    if let Some(access) = &state.access {
+        security_http::authorize(&guard, access)?;
+    }
+    Ok(guard)
 }
 
 fn map_lqs_error(error: LqsError) -> ApiError {
     let (status, code) = match error {
+        LqsError::AccessDenied => (StatusCode::FORBIDDEN, "AccessDenied"),
         LqsError::PurgeQueueInProgress => (
             StatusCode::BAD_REQUEST,
             "AWS.SimpleQueueService.PurgeQueueInProgress",
