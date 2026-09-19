@@ -11,6 +11,14 @@ mod fifo;
 pub use fifo::{DeduplicationScope, FifoThroughputLimit, ReceiveOptions};
 use fifo::{replay_attempt, save_attempt, validate_fifo};
 
+#[path = "management.rs"]
+mod management;
+pub use management::{QueueMetrics, QueuePage, QueueTags};
+
+#[cfg(test)]
+#[path = "management_tests.rs"]
+mod management_tests;
+
 #[cfg(test)]
 #[path = "dlq_tests.rs"]
 mod dlq_tests;
@@ -81,6 +89,7 @@ pub struct QueueOptions {
 /// Partial update: None preserves the current setting.
 #[derive(Debug, Clone, Default)]
 pub struct QueueUpdate {
+    pub visibility_timeout_ms: Option<u64>,
     pub content_based_deduplication: Option<bool>,
     pub deduplication_scope: Option<DeduplicationScope>,
     pub fifo_throughput_limit: Option<FifoThroughputLimit>,
@@ -168,6 +177,9 @@ pub struct ReceivedMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LqsError {
+    PurgeQueueInProgress,
+    QueueDeletedRecently,
+    InvalidQueueManagement(String),
     QueueAlreadyExists(String),
     QueueNotFound(String),
     InvalidFifoName(String),
@@ -192,6 +204,15 @@ pub enum LqsError {
 impl fmt::Display for LqsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PurgeQueueInProgress => {
+                write!(f, "PurgeQueue was called within the last 60 seconds")
+            }
+            Self::QueueDeletedRecently => {
+                write!(f, "wait 60 seconds before recreating a deleted queue")
+            }
+            Self::InvalidQueueManagement(message) => {
+                write!(f, "invalid queue management request: {message}")
+            }
             Self::QueueAlreadyExists(name) => write!(f, "queue already exists: {name}"),
             Self::QueueNotFound(name) => write!(f, "queue not found: {name}"),
             Self::InvalidFifoName(name) => write!(f, "FIFO queue name must end with .fifo: {name}"),
@@ -206,7 +227,7 @@ impl fmt::Display for LqsError {
             Self::EmptyGroupId => write!(f, "message_group_id may not be empty"),
             Self::InvalidReceiptHandle(handle) => write!(f, "invalid receipt handle: {handle}"),
             Self::InvalidVisibilityTimeout => {
-                write!(f, "visibility timeout must be greater than zero")
+                write!(f, "visibility timeout must be 0-43200000ms")
             }
             Self::Database(message) => write!(f, "database error: {message}"),
             Self::InvalidReceiveOptions => write!(
@@ -270,7 +291,7 @@ impl Lqs {
             CREATE TABLE IF NOT EXISTS queues (
                 name TEXT PRIMARY KEY NOT NULL,
                 queue_type TEXT NOT NULL CHECK(queue_type IN ('standard', 'fifo')),
-                visibility_timeout_ms INTEGER NOT NULL CHECK(visibility_timeout_ms > 0),
+                visibility_timeout_ms INTEGER NOT NULL CHECK(visibility_timeout_ms BETWEEN 0 AND 43200000),
                 content_based_deduplication INTEGER NOT NULL CHECK(content_based_deduplication IN (0, 1)),
                 deduplication_window_ms INTEGER NOT NULL
             );
@@ -308,6 +329,9 @@ impl Lqs {
             ",
         )?;
         // Additive, transactional migration also upgrades databases from before #4.
+        // The v9 queue CHECK migration rebuilds the parent table without cascading
+        // deletes. Foreign keys are validated before commit and re-enabled below.
+        connection.pragma_update(None, "foreign_keys", "OFF")?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (table, column, definition) in [
             (
@@ -371,7 +395,17 @@ impl Lqs {
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_created ON messages(queue_name, created_at_ms)")?;
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_inflight ON messages(queue_name, invisible_until_ms)")?;
         fifo::migrate(&transaction)?;
+        management::migrate(&transaction)?;
+        if transaction
+            .prepare("PRAGMA foreign_key_check")?
+            .exists([])?
+        {
+            return Err(LqsError::Database(
+                "foreign key check failed during migration".into(),
+            ));
+        }
         transaction.commit()?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self { connection })
     }
 
@@ -381,14 +415,32 @@ impl Lqs {
         queue_type: QueueType,
         options: QueueOptions,
     ) -> Result<(), LqsError> {
+        self.create_queue_with_tags_at(
+            name,
+            queue_type,
+            options,
+            QueueTags::new(),
+            management::now_ms(),
+        )
+    }
+
+    pub fn create_queue_with_tags_at(
+        &mut self,
+        name: impl Into<String>,
+        queue_type: QueueType,
+        options: QueueOptions,
+        tags: QueueTags,
+        now_ms: u64,
+    ) -> Result<(), LqsError> {
         let name = name.into();
+        management::validate_tags(&tags)?;
         if queue_type == QueueType::Fifo && !name.ends_with(".fifo") {
             return Err(LqsError::InvalidFifoName(name));
         }
         if queue_type == QueueType::Standard && name.ends_with(".fifo") {
             return Err(LqsError::InvalidStandardName(name));
         }
-        if options.visibility_timeout_ms == 0 {
+        if options.visibility_timeout_ms > 43_200_000 {
             return Err(LqsError::InvalidVisibilityTimeout);
         }
         validate_delivery_options(
@@ -411,6 +463,17 @@ impl Lqs {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted: Option<i64> = transaction
+            .query_row(
+                "SELECT deleted_at_ms FROM deleted_queues WHERE name = ?1",
+                [&name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if deleted.is_some_and(|deleted| ms(now_ms) < deleted.saturating_add(60_000)) {
+            return Err(LqsError::QueueDeletedRecently);
+        }
+        transaction.execute("DELETE FROM deleted_queues WHERE name = ?1", [&name])?;
         let result = transaction.execute(
             "INSERT INTO queues(name, queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms, delay_ms, message_retention_ms, maximum_message_size, receive_wait_time_ms, max_in_flight)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -418,6 +481,11 @@ impl Lqs {
         );
         match result {
             Ok(_) => {
+                transaction.execute(
+                    "UPDATE queues SET created_at_ms = ?2, modified_at_ms = ?2 WHERE name = ?1",
+                    params![name, ms(now_ms)],
+                )?;
+                management::write_tags(&transaction, &name, &tags)?;
                 transaction.execute("UPDATE queues SET deduplication_scope = ?2, fifo_throughput_limit = ?3 WHERE name = ?1", params![name, options.deduplication_scope.as_str(), options.fifo_throughput_limit.as_str()])?;
                 write_redrive_policy(&transaction, &name, options.redrive_policy.as_ref())?;
                 transaction.commit()?;
@@ -740,6 +808,10 @@ impl Lqs {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         write_redrive_policy(&transaction, queue_name, policy.as_ref())?;
+        transaction.execute(
+            "UPDATE queues SET modified_at_ms = ?2 WHERE name = ?1",
+            params![queue_name, ms(management::now_ms())],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -822,6 +894,12 @@ impl Lqs {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = read_queue_config(&transaction, name)?;
+        let visibility = update
+            .visibility_timeout_ms
+            .unwrap_or(current.visibility_timeout_ms);
+        if visibility > 43_200_000 {
+            return Err(LqsError::InvalidVisibilityTimeout);
+        }
         let delay = update.delay_ms.unwrap_or(current.delay_ms);
         let retention = update
             .message_retention_ms
@@ -835,6 +913,10 @@ impl Lqs {
         let max_in_flight = update.max_in_flight.unwrap_or(current.max_in_flight);
         validate_delivery_options(delay, retention, maximum)?;
         validate_receive_options(wait, max_in_flight)?;
+        transaction.execute(
+            "UPDATE queues SET visibility_timeout_ms = ?2, modified_at_ms = ?3 WHERE name = ?1",
+            params![name, ms(visibility), ms(now_ms)],
+        )?;
         let content_based = update
             .content_based_deduplication
             .unwrap_or(current.content_based_deduplication);
