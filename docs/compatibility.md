@@ -1,0 +1,195 @@
+# SQS 互換仕様・制約
+
+[README に戻る](../README.md)
+
+LQS の各機能の設定値、動作、AWS SQS との差異をまとめます。起動・接続・テスト手順は [README](../README.md)、内部構造は [設計](../DESIGN.md) を参照してください。
+
+## 目次
+
+- [バッチ操作](#batch)
+- [DLQ（Dead-letter queue）](#dlq)
+- [遅延・保持期限・サイズ制限](#delivery)
+- [メッセージ属性とシステム属性](#attributes)
+- [ロングポーリングと in-flight 上限](#polling)
+- [FIFO の重複排除と受信再試行](#fifo)
+- [キュー管理・タグ・メトリクス](#management)
+- [アクセスポリシー・暗号化設定のシミュレーション](#security)
+
+<a id="batch"></a>
+
+## バッチ操作
+
+`SendMessageBatch`、`DeleteMessageBatch`、`ChangeMessageVisibilityBatch`は1〜10件を処理します。各エントリーの`Id`は1〜80文字の英数字・`-`・`_`で、バッチ内で一意にします。送信本文とメッセージ属性の合計は最大1 MiBです。
+
+件数・ID・合計サイズが不正な場合はHTTP 400となり、何も変更しません。それ以外のエントリー単位の失敗はHTTP 200の`Failed`へ、成功は`Successful`へ返します。**HTTP 200でも必ず`Failed`を確認してください。** エラーには`Id`・`Code`・`Message`・`SenderFault`が含まれます。
+
+FIFOは入力順で処理し、単体送信と同じ重複排除を適用します。グループID・明示的な重複排除IDは1〜128文字のASCII英数字・記号です。成功エントリーごとにコミットするため、途中の失敗で他の成功分が取り消されることはありません。
+
+Rustでは`send_batch(queue, Vec<BatchEntry<SendRequest>>, now_ms)`、`delete_batch(queue, Vec<BatchEntry<String>>)`、`change_visibility_batch(queue, Vec<BatchEntry<VisibilityChange>>, now_ms)`を利用できます。`BatchEntry`は`id`と`value`、戻り値の`BatchResult`は`successful`と`failed`を持ちます。`VisibilityChange`には`receipt_handle`と`timeout_ms`（0〜43,200,000ミリ秒）を指定します。
+
+<a id="dlq"></a>
+
+## DLQ（Dead-letter queue）
+
+先にソースと同じ種別のDLQを作成し、`CreateQueue`の属性または`SetQueueAttributes`で`RedrivePolicy`を設定します。
+
+```json
+{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:failed.fifo","maxReceiveCount":3}
+```
+
+ローカルARNのリージョンは`us-east-1`、アカウントは`000000000000`固定です。`GetQueueAttributes`の`QueueArn`からDLQのARNを取得できます。`maxReceiveCount`は1〜1000で、ソースとDLQの種別一致・DLQの存在を検証します。`RedrivePolicy`を空文字列に設定すると解除できます。
+
+上限回数の受信後、メッセージが再び可視になった状態でソースを受信すると、メッセージをDLQへ原子的に移します。処理中のメッセージは移動しません。`ListDeadLetterSourceQueues`でDLQを参照するソース一覧を取得できます（`MaxResults` / `NextToken`対応）。設定・受信回数・元キュー情報はSQLiteへ永続化します。
+
+Rustでは`QueueOptions::redrive_policy`、`set_redrive_policy`、`redrive_policy`、`list_dead_letter_source_queues`を利用できます。再投入の基礎APIは`redrive_dead_letters(dlq, source, max_messages, now_ms)`です。元キューが一致する可視メッセージを新しいID・受信回数で元キューの末尾へ戻します。HTTPの非同期move-task APIは未実装です。
+
+`GetQueueAttributes`では`QueueArn`・`RedrivePolicy`・配信設定・FIFO設定などを取得できます。全属性の取得には`All`を指定します。
+
+<a id="delivery"></a>
+
+## 遅延・保持期限・サイズ制限
+
+`CreateQueue` / `SetQueueAttributes`で設定し、`GetQueueAttributes`で取得できます。
+
+| HTTP属性 | 範囲・既定値 | RustのQueueOptions |
+| --- | --- | --- |
+| `DelaySeconds` | 0〜900秒、既定0 | `delay_ms`（ミリ秒） |
+| `MessageRetentionPeriod` | 60〜1,209,600秒、既定345,600秒（4日） | `message_retention_ms`（ミリ秒） |
+| `MaximumMessageSize` | 1,024〜1,048,576バイト、既定1 MiB | `maximum_message_size` |
+
+本文自体は1バイト以上が必要で、本文とメッセージ属性の合計が設定上限まで送信できます。文字列はJSON/URLエンコード前のUTF-8バイト数、Binary属性はBase64化前の生バイト数です。Standardは`SendMessage.DelaySeconds`（Rustは`SendRequest.delay_ms`）でキュー既定値を上書きでき、明示的な0は即時配信になります。FIFOはキュー単位のみで、メッセージ単位の指定は0を含めエラーになります。
+
+遅延は初回配信、可視性タイムアウトは受信後の再配信に適用します。保持期限は送信時刻から数え、遅延中・処理中でも期限到達後は配信しません。送信・受信・再投入時に対象キューの期限切れデータを削除します。`queue_depth`は時刻を受け取らないため、削除前の期限切れ行を含む物理件数です。
+
+設定変更はLQSでは即時反映されます。保持期間を短くすると既存メッセージにも適用します。Standardの遅延変更は新規メッセージだけ、FIFOでは未受信メッセージの遅延期限も更新します。Rustからは`set_queue_attributes(name, QueueUpdate { .. }, now_ms)`で更新できます。
+
+<a id="attributes"></a>
+
+## メッセージ属性とシステム属性
+
+`SendMessage` / `SendMessageBatch`の`MessageAttributes`に最大10個の属性を指定できます。`String`・`Number`・`Binary`と、`String.label`・`Number.int`・`Binary.image`などのカスタム接尾辞を保持します。Numberは最大38桁の精度で検証し、余分な先頭・末尾ゼロを除いた十進表現で保存します。BinaryはJSON/QueryではBase64、Rustでは`Vec<u8>`です。
+
+Rustでは`SendRequest::message_attributes`に`MessageAttributes`（属性名から`MessageAttribute { data_type, value }`へのマップ）を指定します。`value`は`MessageAttributeValue::String`（Numberも同じ）または`Binary`です。受信結果の`message_attributes`と`system_attributes`には全属性が入ります。
+
+HTTPの`ReceiveMessage`では、要求された属性だけを返します。指定なしの場合は属性と属性MD5を省略します。
+
+- `MessageAttributeNames`: 属性名、`All`、`.*`、`prefix.*`を指定できます。
+- `MessageSystemAttributeNames`: `SentTimestamp`、`ApproximateFirstReceiveTimestamp`、`ApproximateReceiveCount`、`SenderId`、`SqsManagedSseEnabled`、`MessageGroupId`、`MessageDeduplicationId`、`SequenceNumber`、`DeadLetterQueueSourceArn`または`All`を指定できます。FIFO/DLQ固有の属性は該当時だけ返します。
+- 旧`AttributeNames`もシステム属性の指定として受け付けます。Query形式では`MessageAttributeName.N`、`MessageSystemAttributeName.N`、`AttributeName.N`を使います。
+
+本文と属性はSQLiteに保存され、再起動・再受信・DLQ転送でも保持されます。初回受信時刻は再受信で変わりません。`ApproximateReceiveCount`はDLQ転送をまたいで累計し、手動再投入では新規メッセージとして時刻・回数をリセットします。既存DBの過去の初回受信時刻は復元できないため、移行後の最初の受信時刻になります。
+
+属性サイズは名前・型名（接尾辞込み）・値を合算し、単体上限とバッチ合計上限の両方に含めます。属性MD5は送信応答と、選択された受信属性に対して返します。FIFOの本文ベース重複排除は属性を含めず、本文が同じなら属性が異なっても重複扱いとなり、元の属性は上書きしません。生成する重複排除IDには本文のUTF-8バイト列のSHA-256（小文字16進数）を使用します。
+
+署名を検証しないローカルサービスのため`SenderId`は`000000000000`、暗号化状態は`false`固定です。X-Rayの`AWSTraceHeader`送信や属性のリスト値は未対応です。
+
+<a id="polling"></a>
+
+## ロングポーリングと in-flight 上限
+
+`ReceiveMessage.WaitTimeSeconds`は0〜20秒です。省略時はキュー属性`ReceiveMessageWaitTimeSeconds`（既定0秒）、明示的な0は即時の短ポーリングになります。キュー属性は`CreateQueue` / `SetQueueAttributes` / `GetQueueAttributes`で管理できます。Rustの設定は`QueueOptions::receive_wait_time_ms` / `QueueUpdate::receive_wait_time_ms`です。
+
+ロングポーリングは、受信可能なメッセージが見つかるとすぐ返り、見つからない間は指定期限まで待ちます。待機中にDBをロックせず100ms間隔で再確認するので、他の送受信、遅延や可視性期限の終了、別DB接続からの書き込みにも対応します。`MaxNumberOfMessages`（Rustの`receive`の件数引数も同様）は1〜10件です。Rustの同期`receive`自体は待機せず、HTTP層が非同期の待機を行います。
+
+in-flight上限はキューごとに既定120,000件です。ローカル検証用の独自属性`LqsMaxInFlightMessages`（1〜120,000件）で小さくできます。この属性はAWSにはありません。Rustでは`QueueOptions::max_in_flight` / `QueueUpdate::max_in_flight`で設定します。
+
+| 上限到達時 | Standard | FIFO |
+| --- | --- | --- |
+| 短ポーリング | HTTP 400 `OverLimit` | 空結果 |
+| ロングポーリング | 空きができるまで待機、期限到達で空結果 | 同左 |
+
+削除、可視性期限の終了・0への変更、保持期限で空きが戻ります。`GetQueueAttributes`の`ApproximateNumberOfMessagesNotVisible`とRustの`in_flight_count(queue, now_ms)`で現在の件数を取得できます。上限を現在の件数より小さくしても受信済みメッセージは取り消さず、件数が下がるまで新規受信を止めます。可視性期限切れのハンドルでの延長は`MessageNotInflight`になります。
+
+<a id="fifo"></a>
+
+## FIFO の重複排除と受信再試行
+
+送信の重複排除期間は最初の送信から固定5分です。再送で期間は延長せず、メッセージを削除してもキーは期間中保持します。明示的な`MessageDeduplicationId`は本文ハッシュより優先され、生成済みハッシュと同じIDなら同じ重複排除キーになります。Rustの既存フィールド`deduplication_window_ms`には300,000以外を指定できません。
+
+`CreateQueue` / `SetQueueAttributes` / `GetQueueAttributes`で次のFIFO専用属性を扱えます。
+
+| 属性 | 値 | 既定値 |
+| --- | --- | --- |
+| `ContentBasedDeduplication` | `true` / `false` | `false` |
+| `DeduplicationScope` | `queue` / `messageGroup` | `queue` |
+| `FifoThroughputLimit` | `perQueue` / `perMessageGroupId` | `perQueue` |
+
+`perMessageGroupId`には`messageGroup`が必須です。設定の組み合わせは更新後の値で検証し、不正なら全属性を変更しません。`messageGroup`では同じ重複排除IDでもグループが異なれば別メッセージとして受理します。LQSは設定と重複排除範囲をモデル化しますが、AWSのリージョン別TPS制限・パーティション分散は再現しません。
+
+FIFOの`ReceiveMessage.ReceiveRequestAttemptId`には1〜128文字のASCII英数字・記号を指定できます。同じIDの再試行は初回応答から5分間、同じメッセージ・receipt handle・受信回数を返し、可視性期限をリセットします。受信結果はSQLiteに保存するため再起動・別接続でも有効です。空の応答も保存し、ロングポーリングの空応答は待機終了時に確定します。初回受信で使った`MaxNumberOfMessages`と`VisibilityTimeout`（省略を含む）は再試行でも同じ指定にしてください。
+
+対象の一部でも削除・可視性変更・別リクエストでの再受信・DLQ転送・保持期限切れが起きた場合、LQSはそのIDの再試行を`InvalidParameterValue`で拒否します。期限切れ後は同じIDを新しい受信として扱います。`VisibilityTimeout`は受信単位に0〜43,200秒で指定できます。Rustでは`receive_with_options`と`ReceiveOptions`を使用します。受信済み結果の再試行はin-flight上限到達時も可能ですが、可視性が切れたメッセージを再びin-flightにする際にローカル上限を超える場合は`OverLimit`です。
+
+既存DBは自動移行し、メッセージ・明示的な重複排除キーを保持します。旧設定の重複排除窓は5分へ統一します。旧FNVハッシュを使う履歴は明示IDと区別できないためSHA-256へ書き換えません。アップグレードをまたぐ本文ベースの再送は重複排除されない可能性があるため、送信を5分以上停止してから切り替えるか、明示IDを利用してください。旧履歴で削除済みメッセージのグループが不明なキーは、残りの有効期間だけ全グループに適用します。
+
+仕様参考: [FIFOの重複排除](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html)、[FIFO属性](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html)、[ReceiveMessage](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html)。
+
+<a id="management"></a>
+
+## キュー管理・タグ・メトリクス
+
+JSON / Queryの両方で`ListQueues`、`GetQueueUrl`、`DeleteQueue`、`PurgeQueue`、`TagQueue`、`UntagQueue`、`ListQueueTags`を利用できます。
+
+`ListQueues`は名前順・大文字小文字を区別するリテラルの`QueueNamePrefix`検索です。`MaxResults`は1〜1,000で、明示した場合だけ続きの`NextToken`を返します。次のページにも同じprefixを指定してください。ページングは名前を基準とし、一覧全体のスナップショットではありません。`GetQueueUrl`は名前からURLを取得し、任意の`QueueOwnerAWSAccountId`はローカルの`000000000000`のみを受け付けます。
+
+`GetQueueAttributes`には以下も含まれます。属性を省略すると空、`All`は対応する全属性を返します。
+
+| 属性 | LQSでの意味 |
+| --- | --- |
+| `ApproximateNumberOfMessages` | 可視状態のメッセージ数（FIFOで先行メッセージにブロックされたものを含む） |
+| `ApproximateNumberOfMessagesNotVisible` | 可視性期限内のin-flight数 |
+| `ApproximateNumberOfMessagesDelayed` | 遅延期限前でin-flightではない件数 |
+| `FifoQueue` | FIFOは`true`、Standardは`false` |
+| `CreatedTimestamp` / `LastModifiedTimestamp` | 作成・設定更新のUnix秒 |
+
+メトリクスは保持期限切れを除いたSQLite上の即時集計です。AWSの非同期な近似更新は再現しません。旧DBで不明な作成・更新日時は0です。`SetQueueAttributes.VisibilityTimeout`は0〜43,200秒（既定30秒）で、受信済みの可視性期限は変更せず、次回の受信から適用します。設定変更とタグは再起動後も維持されます。ポリシー・SSE/KMSの設定モデルは下記の範囲で対応し、RedriveAllowPolicy等の未対応設定はエラーにします。
+
+タグはキー1〜128文字・値0〜256文字のUnicode文字列です。Unicode英数字・空白と`_ . : / = + - @`を使え、`aws:`プレフィックスは使用できません。LQSの上限は1キュー50タグです（AWSでは50以下が推奨）。同名キーは上書き、存在しないキーの削除は成功し、不正な更新は全体を巻き戻します。`CreateQueue`の`tags`にも対応します。同名・同設定での再作成は既存タグを変更しないため、更新には`TagQueue`を使ってください。Query形式は`Tag.N.Key` / `Tag.N.Value`、`TagKey.N`です。
+
+### パージと削除の安全性
+
+どちらも破壊的な操作で、削除したメッセージは復元できません。HTTPでは`LQS_BASE_URL/000000000000/キュー名`または`/000000000000/キュー名`の正確な指定を要求します。末尾のスラッシュは許容しますが、別ホスト・別アカウント・クエリ文字列・キュー名だけのURLでは実行しません。
+
+- `PurgeQueue`は実行時点の対象キューの可視・in-flight・遅延メッセージを同一トランザクションで即時削除します。キュー設定・タグ・DLQ設定・送信重複排除キーは維持し、受信再試行の履歴を無効化します。別キューやDLQのメッセージ、パージ完了後の新規送信は削除しません。60秒以内の再パージは`AWS.SimpleQueueService.PurgeQueueInProgress`です。この待機時間も永続化します。AWSの最大60秒の非同期削除は再現しません。
+- `DeleteQueue`は対象キューとそのメッセージ・タグ・重複排除・受信再試行データを原子的に削除します。対象を参照するDLQポリシーは解除し、他キューに残るメッセージの元キュー参照は外しますが、他キュー内のメッセージそのものは残します。同名キューは60秒間再作成できず、`AWS.SimpleQueueService.QueueDeletedRecently`となります。削除自体は即時です。
+
+Rustでは`list_queues`、`queue_exists`、`queue_metrics`、`tag_queue`、`untag_queue`、`list_queue_tags`、`purge_queue`、`delete_queue`を利用できます。時刻を制御した作成・初期タグ設定には`create_queue_with_tags_at`を使用します。
+
+仕様参考: [ListQueues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ListQueues.html)、[PurgeQueue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_PurgeQueue.html)、[DeleteQueue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteQueue.html)、[タグ制約](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-queues.html)。
+
+<a id="security"></a>
+
+## アクセスポリシー・暗号化設定のシミュレーション
+
+これはローカル開発用の認可・構成シミュレーションです。**AWS認証や実データ暗号化を提供するものではありません。インターネットや信頼できないクライアントへ公開しないでください。**
+
+### ポリシーと権限
+
+`CreateQueue` / `SetQueueAttributes` / `GetQueueAttributes`の`Policy`に、JSON文字列のキューポリシーを指定できます。SQLiteへ永続化し、更新時刻も記録します。ポリシーが存在するキューでは明示的Allowが必要で、どれか一つでも一致するDenyがあれば403 `AccessDenied`を返します。Send/Receive/Deleteと対応するバッチ、可視性変更、キュー管理、権限・属性変更を同じように検査します。ロングポーリングとFIFO受信再試行も各処理前に最新ポリシーを確認します。
+
+- 対応要素: `Version`（2012-10-17 / 2008-10-17）、任意の`Id`、`Statement`（オブジェクトまたは配列）、`Sid`、`Effect`、`Principal`、`Action`、`Resource`。
+- Principal: `"*"`、または`{"AWS": "12桁アカウントIDまたはIAM user/role/root ARN"}`。AWS値は配列も可能です。account/rootはそのアカウントのuser/roleにも一致します。Service/STS/フェデレーションのPrincipalは未対応です。
+- Action: `sqs:SendMessage`等、`sqs:*`や`*`/`?`パターン。Actionの一致は大文字小文字を区別せず、ResourceのSQS ARNは区別します。バッチ操作の権限は対応する単体操作へ対応付けます。
+- 上限: 8 KiB、20 Statement、合計50 Principal、各Statement 7 Action。`Condition`、`NotAction`、`NotResource`、`NotPrincipal`など未対応要素は、無視せず設定時に拒否します。IAM identity policy、SCP、permission boundary、ABAC、クロスアカウント二重認可は評価しません。
+
+`AddPermission`は`Label`をSidとするAllow文を既存ポリシーへ追加し、`RemovePermission`は該当Sidだけを除きます。既存のDenyや他の文は維持します。Labelは1〜80文字の英数字・`-`・`_`、AWSAccountIdsは12桁のアカウント番号、Actionsは`SendMessage`等の操作名または`*`です。重複Labelはエラー、存在しないLabelの削除は成功します。最後の文を削除しても空のポリシーを保持し、暗黙の拒否は解除しません。
+
+互換性のため、**Policy未設定のキューはローカル開放モード**です。`Policy=""`で削除すると再び開放されます。所有者への暗黙の権限付与はしないため、設定前に管理用Principalへ`SetQueueAttributes` / `AddPermission` / `RemovePermission`等の権限を含めてください。最初のAddPermissionだけで管理権限がなくなる場合もあります。自分を拒否するポリシーを設定するとHTTPから戻せなくなるため、信頼されたRust管理コードから設定を復旧してください。Rustの`Lqs`直接操作は管理用で、HTTP認可を自動適用しません。
+
+### 呼び出し元の識別・認可フック
+
+既定では全HTTPリクエストをAnonymousとして評価し、`x-lqs-principal`を受け付けません。AWS SDKのSigV4ヘッダーは署名検証せず、そこからアカウントや権限を推定することもありません。
+
+ローカルの権限テストに限り、`LQS_TRUST_PRINCIPAL_HEADER=true`で起動すると`x-lqs-principal`にアカウントIDまたはIAM ARNを指定できます。**これはクライアントの自己申告で、誰でもなりすませます。認証ではありません。** ヘッダー省略時はAnonymousです。
+
+埋め込み用途では`router_with_authorization(lqs, base_url, Arc<AuthorizationHook>)`を利用します。フックはメソッド・URI・ヘッダー・元のbody・action・queue名を受け取り、検証済みの`RequestIdentity`か`LqsError::AccessDenied`を返します。フックは同期・非ブロッキングで実装してください。戻されたidentityでもキューポリシーを回避できません。新規CreateQueueとListQueuesは対象キューポリシーがないため、このフックでグローバルな許可を制御します。既定では新規作成・一覧は開放されます。署名検証、TLS、認証情報の管理、監査イベント記録は利用側の責任です。設定は取得できますがCloudTrail相当の監査ログは実装していません。
+
+同じサーバー内のポリシー確認と各操作は同じDB Mutex内で行います。DBファイルへ直接書けるプロセスや別の組み込み`Lqs`接続は信頼された管理者として扱います。SQLiteファイルのアクセス権や、複数プロセス間の認可境界をこのフックで保護するものではありません。
+
+### SSE-SQS / KMS構成モデル
+
+`SqsManagedSseEnabled`（既定false）、`KmsMasterKeyId`、`KmsDataKeyReusePeriodSeconds`（60〜86,400秒、既定300）をCreate/Set/Getで保持します。SSE-SQSとKMSを同時に有効化できません。KMSキー指定はSSE-SQSを無効化し、SSE-SQSの有効化はKMSキーを解除します。空のKmsMasterKeyIdはKMSを解除します。キーは識別子として保存するだけで、実在性・キーへの権限は確認しません。
+
+**メッセージ本文・属性・FIFO受信キャッシュ・SQLite/WAL/バックアップはすべて平文のままです。** 暗号化・復号、AWS KMS呼び出し、データキー生成/キャッシュ/ローテーションは行いません。キュー属性の`SqsManagedSseEnabled=true`は要求された構成を示すだけです。実暗号化を誤認させないため、受信メッセージのシステム属性`SqsManagedSseEnabled`はfalseのままです。ポリシーと暗号化設定はPurgeで維持し、DeleteQueueで削除します。
+
+仕様参考: [SQSの操作と権限対応](https://docs.aws.amazon.com/service-authorization/latest/reference/list_sqs.html)、[AddPermission](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_AddPermission.html)、[SetQueueAttributes](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html)。
