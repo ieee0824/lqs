@@ -80,11 +80,12 @@ pub(super) fn execute(
         _ => "ChangeMessageVisibilityBatch",
     };
     if action == "SendMessageBatch" {
-        validate_batch_size(
-            entries
-                .iter()
-                .map(|entry| entry.value.string("MessageBody").map_or(0, str::len)),
-        )?;
+        validate_batch_size(entries.iter().map(|entry| {
+            let body = entry.value.string("MessageBody").unwrap_or_default();
+            attributes_http::parse_attributes(&entry.value)
+                .map(|attributes| crate::message_attributes::payload_size(body, &attributes))
+                .unwrap_or(body.len())
+        }))?;
     }
     let now = unix_time_ms();
     let mut lqs = lock_lqs(state)?;
@@ -95,6 +96,9 @@ pub(super) fn execute(
             let fifo = lqs.queue_config(&queue)?.queue_type == QueueType::Fifo;
             let sent = lqs.send(&queue, request, now)?;
             let mut value = json!({ "MessageId": sent.message_id, "MD5OfMessageBody": digest });
+            if let Some(digest) = sent.md5_of_message_attributes {
+                value["MD5OfMessageAttributes"] = json!(digest);
+            }
             if fifo {
                 value["SequenceNumber"] = json!(sequence_number(&sent.message_id));
             }
