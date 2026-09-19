@@ -3,6 +3,10 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+#[cfg(test)]
+#[path = "dlq_tests.rs"]
+mod dlq_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueType {
     Standard,
@@ -32,6 +36,13 @@ pub struct QueueOptions {
     pub visibility_timeout_ms: u64,
     pub content_based_deduplication: bool,
     pub deduplication_window_ms: u64,
+    pub redrive_policy: Option<RedrivePolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedrivePolicy {
+    pub dead_letter_queue: String,
+    pub max_receive_count: u32,
 }
 
 impl Default for QueueOptions {
@@ -40,6 +51,7 @@ impl Default for QueueOptions {
             visibility_timeout_ms: 30_000,
             content_based_deduplication: false,
             deduplication_window_ms: 300_000,
+            redrive_policy: None,
         }
     }
 }
@@ -94,6 +106,7 @@ pub enum LqsError {
     EmptyGroupId,
     InvalidReceiptHandle(String),
     InvalidVisibilityTimeout,
+    InvalidRedrivePolicy(String),
     Database(String),
 }
 
@@ -117,6 +130,7 @@ impl fmt::Display for LqsError {
                 write!(f, "visibility timeout must be greater than zero")
             }
             Self::Database(message) => write!(f, "database error: {message}"),
+            Self::InvalidRedrivePolicy(message) => write!(f, "invalid redrive policy: {message}"),
         }
     }
 }
@@ -180,6 +194,17 @@ impl Lqs {
                 seen_at_ms INTEGER NOT NULL,
                 PRIMARY KEY(queue_name, deduplication_id)
             );
+            CREATE TABLE IF NOT EXISTS redrive_policies (
+                source_queue TEXT PRIMARY KEY NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
+                dead_letter_queue TEXT NOT NULL REFERENCES queues(name),
+                max_receive_count INTEGER NOT NULL CHECK(max_receive_count BETWEEN 1 AND 1000),
+                CHECK(source_queue != dead_letter_queue)
+            );
+            CREATE INDEX IF NOT EXISTS redrive_by_target ON redrive_policies(dead_letter_queue, source_queue);
+            CREATE TABLE IF NOT EXISTS dead_letter_origins (
+                sequence INTEGER PRIMARY KEY REFERENCES messages(sequence) ON DELETE CASCADE,
+                source_queue TEXT NOT NULL REFERENCES queues(name)
+            );
             ",
         )?;
         Ok(Self { connection })
@@ -201,13 +226,20 @@ impl Lqs {
         if options.visibility_timeout_ms == 0 {
             return Err(LqsError::InvalidVisibilityTimeout);
         }
-        let result = self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = transaction.execute(
             "INSERT INTO queues(name, queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![name, queue_type.as_db_value(), ms(options.visibility_timeout_ms), i64::from(options.content_based_deduplication), ms(options.deduplication_window_ms)],
         );
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                write_redrive_policy(&transaction, &name, options.redrive_policy.as_ref())?;
+                transaction.commit()?;
+                Ok(())
+            }
             Err(rusqlite::Error::SqliteFailure(error, _)) if error.extended_code == 1555 => {
                 Err(LqsError::QueueAlreadyExists(name))
             }
@@ -298,12 +330,30 @@ impl Lqs {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut received = Vec::with_capacity(max_messages);
-        for _ in 0..max_messages {
+        let policy = read_redrive_policy(&transaction, queue_name)?;
+        while received.len() < max_messages {
             let Some(candidate) =
                 next_receivable(&transaction, queue_name, config.queue_type, now)?
             else {
                 break;
             };
+            if let Some(policy) = &policy
+                && candidate.receive_count >= i64::from(policy.max_receive_count)
+            {
+                let moved = move_message(
+                    &transaction,
+                    candidate.sequence,
+                    &policy.dead_letter_queue,
+                    now,
+                    config.queue_type == QueueType::Fifo,
+                    false,
+                )?;
+                transaction.execute(
+                    "INSERT INTO dead_letter_origins(sequence, source_queue) VALUES (?1, ?2)",
+                    params![moved, queue_name],
+                )?;
+                continue;
+            }
             let receive_count = candidate.receive_count + 1;
             let receipt_handle = format!(
                 "receipt-{:016x}-{receive_count:08x}-{now:016x}",
@@ -366,6 +416,80 @@ impl Lqs {
         )?)
     }
 
+    /// Atomically replaces or removes a queue's redrive policy.
+    pub fn set_redrive_policy(
+        &mut self,
+        queue_name: &str,
+        policy: Option<RedrivePolicy>,
+    ) -> Result<(), LqsError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        write_redrive_policy(&transaction, queue_name, policy.as_ref())?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn redrive_policy(&self, queue_name: &str) -> Result<Option<RedrivePolicy>, LqsError> {
+        queue_type(&self.connection, queue_name)?;
+        read_redrive_policy(&self.connection, queue_name)
+    }
+
+    pub fn list_dead_letter_source_queues(
+        &self,
+        dead_letter_queue: &str,
+    ) -> Result<Vec<String>, LqsError> {
+        queue_type(&self.connection, dead_letter_queue)?;
+        let mut statement = self.connection.prepare(
+            "SELECT source_queue FROM redrive_policies WHERE dead_letter_queue = ?1 ORDER BY source_queue",
+        )?;
+        Ok(statement
+            .query_map([dead_letter_queue], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Re-enqueues available dead letters originally from `source_queue` as new messages.
+    /// In-flight messages and blocked FIFO group members are left untouched.
+    /// This synchronous primitive is the foundation for a future HTTP move-task API.
+    pub fn redrive_dead_letters(
+        &mut self,
+        dead_letter_queue: &str,
+        source_queue: &str,
+        max_messages: usize,
+        now_ms: u64,
+    ) -> Result<usize, LqsError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let target_type = queue_type(&transaction, source_queue)?;
+        if queue_type(&transaction, dead_letter_queue)? != target_type
+            || dead_letter_queue == source_queue
+        {
+            return Err(LqsError::InvalidRedrivePolicy(
+                "source and DLQ must be distinct queues of the same type".into(),
+            ));
+        }
+        let mut moved = 0;
+        while moved < max_messages {
+            let candidate: Option<i64> = transaction.query_row(
+                "SELECT m.sequence FROM messages m JOIN dead_letter_origins o ON o.sequence = m.sequence
+                 WHERE m.queue_name = ?1 AND o.source_queue = ?2
+                 AND (m.invisible_until_ms IS NULL OR m.invisible_until_ms <= ?3)
+                 AND (?4 = 'standard' OR NOT EXISTS (
+                     SELECT 1 FROM messages earlier WHERE earlier.queue_name = m.queue_name
+                     AND earlier.group_id = m.group_id AND earlier.sequence < m.sequence))
+                 ORDER BY m.sequence LIMIT 1",
+                params![dead_letter_queue, source_queue, ms(now_ms), target_type.as_db_value()],
+                |row| row.get(0),
+            ).optional()?;
+            let Some(sequence) = candidate else { break };
+            move_message(&transaction, sequence, source_queue, ms(now_ms), true, true)?;
+            moved += 1;
+        }
+        transaction.commit()?;
+        Ok(moved)
+    }
+
     pub(crate) fn queue_config(&self, queue_name: &str) -> Result<QueueConfig, LqsError> {
         let row = self.connection.query_row(
             "SELECT queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms FROM queues WHERE name = ?1",
@@ -377,6 +501,7 @@ impl Lqs {
             visibility_timeout_ms: row.1 as u64,
             content_based_deduplication: row.2 != 0,
             deduplication_window_ms: row.3 as u64,
+            redrive_policy: read_redrive_policy(&self.connection, queue_name)?,
         })
     }
 }
@@ -386,12 +511,104 @@ impl Default for Lqs {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QueueConfig {
     pub(crate) queue_type: QueueType,
     pub(crate) visibility_timeout_ms: u64,
     pub(crate) content_based_deduplication: bool,
     pub(crate) deduplication_window_ms: u64,
+    pub(crate) redrive_policy: Option<RedrivePolicy>,
+}
+
+fn queue_type(connection: &Connection, name: &str) -> Result<QueueType, LqsError> {
+    let value: String = connection
+        .query_row(
+            "SELECT queue_type FROM queues WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| LqsError::QueueNotFound(name.to_owned()))?;
+    QueueType::from_db_value(&value)
+}
+
+fn read_redrive_policy(
+    connection: &Connection,
+    name: &str,
+) -> Result<Option<RedrivePolicy>, LqsError> {
+    Ok(connection.query_row(
+        "SELECT dead_letter_queue, max_receive_count FROM redrive_policies WHERE source_queue = ?1", [name],
+        |row| Ok(RedrivePolicy { dead_letter_queue: row.get(0)?, max_receive_count: row.get(1)? }),
+    ).optional()?)
+}
+
+fn write_redrive_policy(
+    transaction: &rusqlite::Transaction<'_>,
+    source: &str,
+    policy: Option<&RedrivePolicy>,
+) -> Result<(), LqsError> {
+    let source_type = queue_type(transaction, source)?;
+    if let Some(policy) = policy {
+        if !(1..=1000).contains(&policy.max_receive_count) || policy.dead_letter_queue == source {
+            return Err(LqsError::InvalidRedrivePolicy(
+                "maxReceiveCount must be 1-1000 and the DLQ must differ from the source".into(),
+            ));
+        }
+        let target_type =
+            queue_type(transaction, &policy.dead_letter_queue).map_err(|error| match error {
+                LqsError::QueueNotFound(name) => {
+                    LqsError::InvalidRedrivePolicy(format!("DLQ does not exist: {name}"))
+                }
+                other => other,
+            })?;
+        if target_type != source_type {
+            return Err(LqsError::InvalidRedrivePolicy(
+                "source and DLQ queue types must match".into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO redrive_policies(source_queue, dead_letter_queue, max_receive_count) VALUES (?1, ?2, ?3)
+             ON CONFLICT(source_queue) DO UPDATE SET dead_letter_queue = excluded.dead_letter_queue, max_receive_count = excluded.max_receive_count",
+            params![source, policy.dead_letter_queue, policy.max_receive_count],
+        )?;
+    } else {
+        transaction.execute(
+            "DELETE FROM redrive_policies WHERE source_queue = ?1",
+            [source],
+        )?;
+    }
+    Ok(())
+}
+
+/// Delete and reinsert in one transaction so destination ordering uses enqueue order,
+/// not the source's old sequence. Any failure rolls the entire receive/redrive back.
+fn move_message(
+    transaction: &rusqlite::Transaction<'_>,
+    sequence: i64,
+    destination: &str,
+    now: i64,
+    reset_timestamp: bool,
+    new_identity: bool,
+) -> Result<i64, LqsError> {
+    let (message_id, body, group_id, created_at): (String, String, Option<String>, i64) =
+        transaction.query_row(
+            "SELECT message_id, body, group_id, created_at_ms FROM messages WHERE sequence = ?1",
+            [sequence],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    transaction.execute("DELETE FROM messages WHERE sequence = ?1", [sequence])?;
+    transaction.execute(
+        "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![if new_identity { None } else { Some(message_id) }, destination, body, group_id, if reset_timestamp { now } else { created_at }],
+    )?;
+    let moved = transaction.last_insert_rowid();
+    if new_identity {
+        transaction.execute(
+            "UPDATE messages SET message_id = ?1 WHERE sequence = ?2",
+            params![format!("msg-{moved:016x}"), moved],
+        )?;
+    }
+    Ok(moved)
 }
 struct Candidate {
     sequence: i64,

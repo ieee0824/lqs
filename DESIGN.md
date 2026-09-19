@@ -35,12 +35,24 @@ HTTP層は `ServerConfig`、Axumルーター、SQLite-backed `Lqs`を分離し�
 
 サーバーからライブラリAPIへ渡す時刻にはUnix時刻のミリ秒を使い、SQLiteファイルを開き直した後も可視性期限を比較できるようにします。
 
+## DLQと再投入
+
+`redrive_policies`にソース・DLQ・上限受信回数を、`dead_letter_origins`に移動したメッセージの元キューを保存します。既存DBには追加テーブルと索引のみを作成するため、既存キュー・メッセージを保持したまま更新できます。キュー作成とポリシー登録は同一トランザクションで行い、不正設定の場合はキューも残しません。
+
+`receive`は候補選択・回数判定・DLQ移動・可視性更新を単一のImmediateトランザクションで行います。上限に達したメッセージは可視になるまで移動せず、その後のソース受信で移動します。候補はFIFOの先頭制約を通るため、in-flight中の先行メッセージを追い越しません。移動先では新しいsequenceを採番して末尾へ追加し、旧receipt handleを破棄し、受信回数をリセットします。本文・MessageId・グループIDは保持します。Standardの送信時刻は保持し、FIFOの送信時刻は移動時刻にします。
+
+元キューへの再投入は`redrive_dead_letters`で同期実行できます。元キュー情報が一致する可視メッセージだけを、FIFOグループの先頭制約を維持して移動します。再投入は新しいMessageId・sequence・送信時刻・受信回数を使い、元の送信の重複排除キーには抑制されません。DLQへ直接送信されたメッセージや他ソース由来のメッセージは対象外です。ポリシー解除後も元キュー情報を保持するため再投入可能です。
+
+DLQ移動・再投入の途中でDB操作が失敗すると、削除を含む全変更がロールバックされます。FIFOでは各キュー内の順序を維持しますが、失敗メッセージを別キューへ分離した後の業務処理全体の順序は保証しません。これは[AWSのDLQに関する注意](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)と同じ制約です。
+
+HTTPはJSON/Query双方でRedrivePolicyのCreate/Set/GetとListDeadLetterSourceQueuesに対応します。ARNは`arn:aws:sqs:us-east-1:000000000000:<queue-name>`固定です。非同期のStartMessageMoveTask/Cancel/List操作、RedriveAllowPolicy、メッセージ保持期限はこの実装の対象外です。
+
 ## 時刻とテスト容易性
 
 API はホストの時計を直接読まず、呼び出し側から単調増加の `now_ms` を渡します。これにより、可視性タイムアウトと重複排除の境界を sleep なしで決定的にテストできます。実運用用のアダプターでは `Instant` などの単調時計をミリ秒へ変換して渡します。
 
 ## 境界と将来の拡張
 
-- SQLiteファイルへの永続化は行う。ロングポーリングとDLQは未実装。
+- SQLiteファイルへの永続化とDLQ転送に対応。ロングポーリングは未実装。
 - APIエラーは `LqsError` として返し、設定または送信・受信の誤りを明示する。
 - FIFO のスループット分割は `MessageGroupId` が単位。独立した処理を並列化したい場合はグループを分ける。

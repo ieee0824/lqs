@@ -45,6 +45,22 @@ lqs.delete("orders.fifo", &message.receipt_handle)?;
 
 時刻を引数 `now_ms` として渡すため、可視性タイムアウトと FIFO 重複排除をテストで再現できます。設計と制約は [DESIGN.md](DESIGN.md) を参照してください。
 
+## DLQ（Dead-letter queue）
+
+先にソースと同じ種別のDLQを作成し、`CreateQueue`の属性または`SetQueueAttributes`で`RedrivePolicy`を設定します。
+
+```json
+{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:failed.fifo","maxReceiveCount":3}
+```
+
+ローカルARNのリージョンは`us-east-1`、アカウントは`000000000000`固定です。`GetQueueAttributes`の`QueueArn`からDLQのARNを取得できます。`maxReceiveCount`は1〜1000で、ソースとDLQの種別一致・DLQの存在を検証します。`RedrivePolicy`を空文字列に設定すると解除できます。
+
+上限回数の受信後、メッセージが再び可視になった状態でソースを受信すると、メッセージをDLQへ原子的に移します。処理中のメッセージは移動しません。`ListDeadLetterSourceQueues`でDLQを参照するソース一覧を取得できます（`MaxResults` / `NextToken`対応）。設定・受信回数・元キュー情報はSQLiteへ永続化します。
+
+Rustでは`QueueOptions::redrive_policy`、`set_redrive_policy`、`redrive_policy`、`list_dead_letter_source_queues`を利用できます。再投入の基礎APIは`redrive_dead_letters(dlq, source, max_messages, now_ms)`です。元キューが一致する可視メッセージを新しいID・受信回数で元キューの末尾へ戻します。HTTPの非同期move-task APIは未実装です。
+
+属性管理は今回必要な範囲に対応しています。`SetQueueAttributes`は`RedrivePolicy`のみ、`GetQueueAttributes`は`QueueArn`・`RedrivePolicy`・`VisibilityTimeout`・FIFO設定と`All`を扱います。タグなどのキュー管理機能は別途実装予定です。
+
 ## テスト
 
 Rustの単体テストと、実際のHTTPサーバーへAWS SDK for Go v2で接続する結合テストがあります。
@@ -58,3 +74,4 @@ LQS_ENDPOINT=http://127.0.0.1:9324 go test -v ./...
 ```
 
 GitHub ActionsではRustの整形・Clippy・単体テストに続けてLQSサーバーを起動し、Go SDKからFIFOキューの作成、送信、受信、可視性変更、削除、エラーコードの復元を検証します。
+DLQについてもStandard/FIFOの転送、属性設定・取得、ソース一覧のページング、ポリシー解除、不正設定時のHTTP 400を同じCIで検証します。

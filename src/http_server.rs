@@ -17,7 +17,9 @@ use axum::routing::get;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-use crate::{Lqs, LqsError, QueueOptions, QueueType, ReceivedMessage, SendRequest, SendResult};
+use crate::{
+    Lqs, LqsError, QueueOptions, QueueType, ReceivedMessage, RedrivePolicy, SendRequest, SendResult,
+};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:9324";
 const DEFAULT_DATABASE_PATH: &str = "lqs.sqlite";
@@ -264,13 +266,10 @@ impl WireRequest {
     }
 
     fn unsigned(&self, name: &str) -> Result<Option<u64>, ApiError> {
-        if let Some(value) = self
-            .json
-            .as_ref()
-            .and_then(|json| json.get(name))
-            .and_then(Value::as_u64)
-        {
-            return Ok(Some(value));
+        if let Some(value) = self.json.as_ref().and_then(|json| json.get(name)) {
+            return value.as_u64().map(Some).ok_or_else(|| {
+                ApiError::invalid_parameter(name, "must be a non-negative integer")
+            });
         }
         self.string(name)
             .map(|value| {
@@ -281,17 +280,20 @@ impl WireRequest {
             .transpose()
     }
 
-    fn attributes(&self) -> HashMap<String, String> {
-        if let Some(attributes) = self
-            .json
-            .as_ref()
-            .and_then(|value| value.get("Attributes"))
-            .and_then(Value::as_object)
-        {
+    fn attributes(&self) -> Result<HashMap<String, String>, ApiError> {
+        if let Some(attributes) = self.json.as_ref().and_then(|value| value.get("Attributes")) {
+            let attributes = attributes
+                .as_object()
+                .ok_or_else(|| ApiError::invalid_parameter("Attributes", "must be a string map"))?;
             return attributes
                 .iter()
-                .filter_map(|(name, value)| {
-                    value.as_str().map(|value| (name.clone(), value.to_owned()))
+                .map(|(name, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (name.clone(), value.to_owned()))
+                        .ok_or_else(|| {
+                            ApiError::invalid_parameter(name, "attribute value must be a string")
+                        })
                 })
                 .collect();
         }
@@ -308,7 +310,7 @@ impl WireRequest {
                 attributes.insert(name.clone(), value.clone());
             }
         }
-        attributes
+        Ok(attributes)
     }
 }
 
@@ -326,6 +328,14 @@ enum ApiSuccess {
     },
     DeleteMessage,
     ChangeMessageVisibility,
+    SetQueueAttributes,
+    GetQueueAttributes {
+        attributes: HashMap<String, String>,
+    },
+    ListDeadLetterSourceQueues {
+        queue_urls: Vec<String>,
+        next_cursor: Option<String>,
+    },
 }
 
 impl ApiSuccess {
@@ -357,7 +367,20 @@ impl ApiSuccess {
             Self::ReceiveMessage { messages } => json!({
                 "Messages": messages.iter().map(message_json).collect::<Vec<_>>()
             }),
-            Self::DeleteMessage | Self::ChangeMessageVisibility => json!({}),
+            Self::DeleteMessage | Self::ChangeMessageVisibility | Self::SetQueueAttributes => {
+                json!({})
+            }
+            Self::GetQueueAttributes { attributes } => json!({ "Attributes": attributes }),
+            Self::ListDeadLetterSourceQueues {
+                queue_urls,
+                next_cursor,
+            } => {
+                let mut value = json!({ "queueUrls": queue_urls });
+                if let Some(token) = next_cursor {
+                    value["NextToken"] = json!(token);
+                }
+                value
+            }
         };
         value.to_string()
     }
@@ -392,6 +415,33 @@ impl ApiSuccess {
             ),
             Self::DeleteMessage => ("DeleteMessage", String::new()),
             Self::ChangeMessageVisibility => ("ChangeMessageVisibility", String::new()),
+            Self::SetQueueAttributes => ("SetQueueAttributes", String::new()),
+            Self::GetQueueAttributes { attributes } => (
+                "GetQueueAttributes",
+                attributes
+                    .iter()
+                    .map(|(name, value)| {
+                        format!(
+                            "<Attribute><Name>{}</Name><Value>{}</Value></Attribute>",
+                            xml_escape(name),
+                            xml_escape(value)
+                        )
+                    })
+                    .collect::<String>(),
+            ),
+            Self::ListDeadLetterSourceQueues {
+                queue_urls,
+                next_cursor,
+            } => {
+                let mut result = queue_urls
+                    .iter()
+                    .map(|url| format!("<QueueUrl>{}</QueueUrl>", xml_escape(url)))
+                    .collect::<String>();
+                if let Some(token) = next_cursor {
+                    result.push_str(&format!("<NextToken>{}</NextToken>", xml_escape(token)));
+                }
+                ("ListDeadLetterSourceQueues", result)
+            }
         };
         format!(
             "<?xml version=\"1.0\"?><{action}Response xmlns=\"http://queue.amazonaws.com/doc/2012-11-05/\"><{action}Result>{result}</{action}Result><ResponseMetadata><RequestId>{}</RequestId></ResponseMetadata></{action}Response>",
@@ -482,6 +532,9 @@ fn dispatch(state: &AppState, path: &str, request: WireRequest) -> Result<ApiSuc
         "ReceiveMessage" => receive_message(state, path, &request),
         "DeleteMessage" => delete_message(state, path, &request),
         "ChangeMessageVisibility" => change_message_visibility(state, path, &request),
+        "SetQueueAttributes" => set_queue_attributes(state, path, &request),
+        "GetQueueAttributes" => get_queue_attributes(state, path, &request),
+        "ListDeadLetterSourceQueues" => list_dead_letter_source_queues(state, path, &request),
         _ => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "InvalidAction",
@@ -493,7 +546,7 @@ fn dispatch(state: &AppState, path: &str, request: WireRequest) -> Result<ApiSuc
 fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, ApiError> {
     let name = request.required_string("QueueName")?;
     validate_queue_name(name)?;
-    let attributes = request.attributes();
+    let attributes = request.attributes()?;
     let fifo = parse_bool_attribute(&attributes, "FifoQueue")?.unwrap_or(false);
     let content_based_deduplication =
         parse_bool_attribute(&attributes, "ContentBasedDeduplication")?.unwrap_or(false);
@@ -523,6 +576,11 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
     let options = QueueOptions {
         visibility_timeout_ms,
         content_based_deduplication,
+        redrive_policy: attributes
+            .get("RedrivePolicy")
+            .map(|value| parse_redrive_policy(value))
+            .transpose()?
+            .flatten(),
         ..QueueOptions::default()
     };
     let mut lqs = lock_lqs(state)?;
@@ -536,6 +594,7 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
                         && existing.content_based_deduplication
                             == options.content_based_deduplication
                         && existing.deduplication_window_ms == options.deduplication_window_ms
+                        && existing.redrive_policy == options.redrive_policy
                 })
                 .unwrap_or(false);
         if !same_configuration {
@@ -544,6 +603,193 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
     }
     Ok(ApiSuccess::CreateQueue {
         queue_url: format!("{}/000000000000/{name}", state.public_base_url),
+    })
+}
+
+// LQS is a single-account, single-region local service.
+const QUEUE_ARN_PREFIX: &str = "arn:aws:sqs:us-east-1:000000000000:";
+
+fn parse_redrive_policy(value: &str) -> Result<Option<RedrivePolicy>, ApiError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || {
+        ApiError::invalid_parameter(
+            "RedrivePolicy",
+            "requires a local deadLetterTargetArn and integer maxReceiveCount from 1 to 1000",
+        )
+    };
+    let value: Value = serde_json::from_str(value).map_err(|_| invalid())?;
+    let target = value
+        .get("deadLetterTargetArn")
+        .and_then(Value::as_str)
+        .and_then(|arn| arn.strip_prefix(QUEUE_ARN_PREFIX))
+        .ok_or_else(invalid)?;
+    validate_queue_name(target).map_err(|_| invalid())?;
+    let count = value
+        .get("maxReceiveCount")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .filter(|count| (1..=1000).contains(count))
+        .ok_or_else(invalid)?;
+    Ok(Some(RedrivePolicy {
+        dead_letter_queue: target.to_owned(),
+        max_receive_count: count as u32,
+    }))
+}
+
+fn set_queue_attributes(
+    state: &AppState,
+    path: &str,
+    request: &WireRequest,
+) -> Result<ApiSuccess, ApiError> {
+    let name = queue_name(path, request)?;
+    let attributes = request.attributes()?;
+    if attributes.len() != 1 || !attributes.contains_key("RedrivePolicy") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidAttributeName",
+            "only RedrivePolicy can currently be set",
+        ));
+    }
+    let policy = parse_redrive_policy(&attributes["RedrivePolicy"])?;
+    lock_lqs(state)?
+        .set_redrive_policy(&name, policy)
+        .map_err(map_lqs_error)?;
+    Ok(ApiSuccess::SetQueueAttributes)
+}
+
+fn get_queue_attributes(
+    state: &AppState,
+    path: &str,
+    request: &WireRequest,
+) -> Result<ApiSuccess, ApiError> {
+    let name = queue_name(path, request)?;
+    let config = lock_lqs(state)?
+        .queue_config(&name)
+        .map_err(map_lqs_error)?;
+    let names: Vec<&str> = if let Some(json) = &request.json {
+        match json.get("AttributeNames") {
+            None => Vec::new(),
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value.as_str().ok_or_else(|| {
+                        ApiError::invalid_parameter("AttributeNames", "must be an array of strings")
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            _ => {
+                return Err(ApiError::invalid_parameter(
+                    "AttributeNames",
+                    "must be an array of strings",
+                ));
+            }
+        }
+    } else {
+        request
+            .query
+            .iter()
+            .filter(|(key, _)| key.starts_with("AttributeName."))
+            .map(|(_, value)| value.as_str())
+            .collect()
+    };
+    let mut attributes = HashMap::from([
+        ("QueueArn".to_owned(), format!("{QUEUE_ARN_PREFIX}{name}")),
+        (
+            "VisibilityTimeout".to_owned(),
+            (config.visibility_timeout_ms / 1000).to_string(),
+        ),
+    ]);
+    if config.queue_type == QueueType::Fifo {
+        attributes.insert("FifoQueue".into(), "true".into());
+        attributes.insert(
+            "ContentBasedDeduplication".into(),
+            config.content_based_deduplication.to_string(),
+        );
+    }
+    if let Some(policy) = config.redrive_policy {
+        attributes.insert(
+            "RedrivePolicy".into(),
+            json!({
+                "deadLetterTargetArn": format!("{QUEUE_ARN_PREFIX}{}", policy.dead_letter_queue),
+                "maxReceiveCount": policy.max_receive_count,
+            })
+            .to_string(),
+        );
+    }
+    for name in &names {
+        if ![
+            "All",
+            "QueueArn",
+            "VisibilityTimeout",
+            "FifoQueue",
+            "ContentBasedDeduplication",
+            "RedrivePolicy",
+        ]
+        .contains(name)
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidAttributeName",
+                format!("unsupported attribute: {name}"),
+            ));
+        }
+    }
+    if !names.contains(&"All") {
+        attributes.retain(|key, _| names.contains(&key.as_str()));
+    }
+    Ok(ApiSuccess::GetQueueAttributes { attributes })
+}
+
+fn list_dead_letter_source_queues(
+    state: &AppState,
+    path: &str,
+    request: &WireRequest,
+) -> Result<ApiSuccess, ApiError> {
+    let name = queue_name(path, request)?;
+    let requested_max = request.unsigned("MaxResults")?;
+    let max = requested_max.unwrap_or(1000);
+    if !(1..=1000).contains(&max) {
+        return Err(ApiError::invalid_parameter(
+            "MaxResults",
+            "must be between 1 and 1000",
+        ));
+    }
+    let prefix = format!("lqs-dlq:{name}:");
+    let cursor = request
+        .string("NextToken")
+        .map(|token| {
+            token
+                .strip_prefix(&prefix)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    ApiError::invalid_parameter("NextToken", "invalid token for this DLQ")
+                })
+        })
+        .transpose()?;
+    let mut sources = lock_lqs(state)?
+        .list_dead_letter_source_queues(&name)
+        .map_err(map_lqs_error)?;
+    if let Some(cursor) = cursor {
+        sources.retain(|source| source.as_str() > cursor);
+    }
+    let next_cursor = if sources.len() > max as usize {
+        sources.truncate(max as usize);
+        requested_max.map(|_| format!("{prefix}{}", sources.last().unwrap()))
+    } else {
+        None
+    };
+    let queue_urls = sources
+        .iter()
+        .map(|source| format!("{}/000000000000/{source}", state.public_base_url))
+        .collect();
+    Ok(ApiSuccess::ListDeadLetterSourceQueues {
+        queue_urls,
+        next_cursor,
     })
 }
 
@@ -789,7 +1035,10 @@ mod tests {
         assert_eq!(request.protocol, Protocol::Query);
         assert_eq!(request.action, "CreateQueue");
         assert_eq!(request.required_string("QueueName").unwrap(), "orders.fifo");
-        assert_eq!(request.attributes().get("FifoQueue").unwrap(), "true");
+        assert_eq!(
+            request.attributes().unwrap().get("FifoQueue").unwrap(),
+            "true"
+        );
     }
 
     #[test]
