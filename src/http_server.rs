@@ -28,6 +28,9 @@ mod batch_http;
 #[path = "attributes_http.rs"]
 mod attributes_http;
 
+#[path = "management_http.rs"]
+mod management_http;
+
 #[cfg(test)]
 #[path = "polling_http_tests.rs"]
 mod polling_http_tests;
@@ -325,16 +328,46 @@ impl WireRequest {
                 .collect();
         }
 
-        let mut attributes = HashMap::new();
-        for (key, name) in &self.query {
-            let Some(index) = key
-                .strip_prefix("Attribute.")
-                .and_then(|value| value.strip_suffix(".Name"))
-            else {
+        let mut entries =
+            std::collections::BTreeMap::<String, (Option<String>, Option<String>)>::new();
+        for (key, value) in &self.query {
+            let Some(rest) = key.strip_prefix("Attribute.") else {
                 continue;
             };
-            if let Some(value) = self.query.get(&format!("Attribute.{index}.Value")) {
-                attributes.insert(name.clone(), value.clone());
+            let (index, field) = if matches!(rest, "Name" | "Value") {
+                ("1", rest)
+            } else {
+                rest.split_once('.')
+                    .ok_or_else(|| ApiError::invalid_parameter("Attributes", "invalid entry"))?
+            };
+            if index
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0 && n.to_string() == index)
+                .is_none()
+                || !matches!(field, "Name" | "Value")
+            {
+                return Err(ApiError::invalid_parameter("Attributes", "invalid entry"));
+            }
+            let entry = entries.entry(index.into()).or_default();
+            let slot = if field == "Name" {
+                &mut entry.0
+            } else {
+                &mut entry.1
+            };
+            if slot.replace(value.clone()).is_some() {
+                return Err(ApiError::invalid_parameter("Attributes", "duplicate field"));
+            }
+        }
+        let mut attributes = HashMap::new();
+        for (_, (name, value)) in entries {
+            let name = name.ok_or_else(|| ApiError::missing("Attribute.Name"))?;
+            let value = value.ok_or_else(|| ApiError::missing("Attribute.Value"))?;
+            if attributes.insert(name, value).is_some() {
+                return Err(ApiError::invalid_parameter(
+                    "Attributes",
+                    "duplicate attribute",
+                ));
             }
         }
         Ok(attributes)
@@ -342,6 +375,11 @@ impl WireRequest {
 }
 
 enum ApiSuccess {
+    Management {
+        action: &'static str,
+        json: Value,
+        xml: String,
+    },
     Batch {
         action: &'static str,
         result: BatchResult<Value, ApiError>,
@@ -380,6 +418,7 @@ impl ApiSuccess {
 
     fn json_body(&self) -> String {
         let value = match self {
+            Self::Management { json, .. } => json.clone(),
             Self::Batch { result, .. } => batch_http::json_result(result),
             Self::CreateQueue { queue_url } => json!({ "QueueUrl": queue_url }),
             Self::SendMessage {
@@ -422,6 +461,7 @@ impl ApiSuccess {
 
     fn xml_body(&self, request_id: &str) -> String {
         let (action, result) = match self {
+            Self::Management { action, xml, .. } => (*action, xml.clone()),
             Self::Batch { action, result } => (*action, batch_http::xml_result(action, result)),
             Self::CreateQueue { queue_url } => (
                 "CreateQueue",
@@ -579,6 +619,8 @@ impl ApiError {
 
 fn dispatch(state: &AppState, path: &str, request: WireRequest) -> Result<ApiSuccess, ApiError> {
     match request.action.as_str() {
+        "ListQueues" | "GetQueueUrl" | "DeleteQueue" | "PurgeQueue" | "TagQueue" | "UntagQueue"
+        | "ListQueueTags" => management_http::execute(state, path, &request),
         "SendMessageBatch" | "DeleteMessageBatch" | "ChangeMessageVisibilityBatch" => {
             batch_http::execute(state, path, &request)
         }
@@ -601,6 +643,8 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
     let name = request.required_string("QueueName")?;
     validate_queue_name(name)?;
     let attributes = request.attributes()?;
+    management_http::validate_attribute_names(&attributes, true)?;
+    let tags = management_http::parse_tags(request)?;
     let fifo = parse_bool_attribute(&attributes, "FifoQueue")?.unwrap_or(false);
     let content_based_deduplication =
         parse_bool_attribute(&attributes, "ContentBasedDeduplication")?.unwrap_or(false);
@@ -616,12 +660,6 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
             .ok_or_else(|| ApiError::invalid_parameter("VisibilityTimeout", "is too large"))?,
         None => QueueOptions::default().visibility_timeout_ms,
     };
-    if visibility_timeout_ms == 0 {
-        return Err(ApiError::invalid_parameter(
-            "VisibilityTimeout",
-            "must be greater than zero in LQS",
-        ));
-    }
     let queue_type = if fifo {
         QueueType::Fifo
     } else {
@@ -662,7 +700,9 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
         ..QueueOptions::default()
     };
     let mut lqs = lock_lqs(state)?;
-    if let Err(error) = lqs.create_queue(name, queue_type, options.clone()) {
+    if let Err(error) =
+        lqs.create_queue_with_tags_at(name, queue_type, options.clone(), tags, unix_time_ms())
+    {
         let same_configuration = matches!(&error, LqsError::QueueAlreadyExists(_))
             && lqs
                 .queue_config(name)
@@ -728,6 +768,12 @@ fn parse_redrive_policy(value: &str) -> Result<Option<RedrivePolicy>, ApiError> 
 
 fn delivery_attributes(attributes: &HashMap<String, String>) -> Result<QueueUpdate, ApiError> {
     Ok(QueueUpdate {
+        visibility_timeout_ms: attributes
+            .get("VisibilityTimeout")
+            .map(|value| {
+                parse_seconds("VisibilityTimeout", value, 0, 43_200).map(|seconds| seconds * 1000)
+            })
+            .transpose()?,
         content_based_deduplication: parse_bool_attribute(attributes, "ContentBasedDeduplication")?,
         deduplication_scope: attributes
             .get("DeduplicationScope")
@@ -788,22 +834,8 @@ fn set_queue_attributes(
 ) -> Result<ApiSuccess, ApiError> {
     let name = queue_name(path, request)?;
     let attributes = request.attributes()?;
-    if attributes.is_empty()
-        || attributes.keys().any(|name| {
-            ![
-                "RedrivePolicy",
-                "ContentBasedDeduplication",
-                "DeduplicationScope",
-                "FifoThroughputLimit",
-                "DelaySeconds",
-                "MessageRetentionPeriod",
-                "MaximumMessageSize",
-                "ReceiveMessageWaitTimeSeconds",
-                "LqsMaxInFlightMessages",
-            ]
-            .contains(&name.as_str())
-        })
-    {
+    management_http::validate_attribute_names(&attributes, false)?;
+    if attributes.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "InvalidAttributeName",
@@ -823,9 +855,9 @@ fn get_queue_attributes(
     request: &WireRequest,
 ) -> Result<ApiSuccess, ApiError> {
     let name = queue_name(path, request)?;
-    let config = lock_lqs(state)?
-        .queue_config(&name)
-        .map_err(map_lqs_error)?;
+    let lqs = lock_lqs(state)?;
+    let config = lqs.queue_config(&name).map_err(map_lqs_error)?;
+    let metrics = lqs.queue_metrics(&name, unix_time_ms())?;
     let names: Vec<&str> = if let Some(json) = &request.json {
         match json.get("AttributeNames") {
             None => Vec::new(),
@@ -848,12 +880,32 @@ fn get_queue_attributes(
         request
             .query
             .iter()
-            .filter(|(key, _)| key.starts_with("AttributeName."))
+            .filter(|(key, _)| key.as_str() == "AttributeName" || key.starts_with("AttributeName."))
             .map(|(_, value)| value.as_str())
             .collect()
     };
     let mut attributes = HashMap::from([
         ("QueueArn".to_owned(), format!("{QUEUE_ARN_PREFIX}{name}")),
+        (
+            "FifoQueue".to_owned(),
+            (config.queue_type == QueueType::Fifo).to_string(),
+        ),
+        (
+            "ApproximateNumberOfMessages".to_owned(),
+            metrics.visible.to_string(),
+        ),
+        (
+            "ApproximateNumberOfMessagesDelayed".to_owned(),
+            metrics.delayed.to_string(),
+        ),
+        (
+            "CreatedTimestamp".to_owned(),
+            (metrics.created_at_ms / 1000).to_string(),
+        ),
+        (
+            "LastModifiedTimestamp".to_owned(),
+            (metrics.modified_at_ms / 1000).to_string(),
+        ),
         (
             "ReceiveMessageWaitTimeSeconds".to_owned(),
             (config.receive_wait_time_ms / 1000).to_string(),
@@ -864,9 +916,7 @@ fn get_queue_attributes(
         ),
         (
             "ApproximateNumberOfMessagesNotVisible".to_owned(),
-            lock_lqs(state)?
-                .in_flight_count(&name, unix_time_ms())?
-                .to_string(),
+            metrics.not_visible.to_string(),
         ),
         (
             "DelaySeconds".to_owned(),
@@ -926,6 +976,10 @@ fn get_queue_attributes(
             "ReceiveMessageWaitTimeSeconds",
             "LqsMaxInFlightMessages",
             "ApproximateNumberOfMessagesNotVisible",
+            "ApproximateNumberOfMessages",
+            "ApproximateNumberOfMessagesDelayed",
+            "CreatedTimestamp",
+            "LastModifiedTimestamp",
         ]
         .contains(name)
         {
@@ -1217,6 +1271,14 @@ fn lock_lqs(state: &AppState) -> Result<std::sync::MutexGuard<'_, Lqs>, ApiError
 
 fn map_lqs_error(error: LqsError) -> ApiError {
     let (status, code) = match error {
+        LqsError::PurgeQueueInProgress => (
+            StatusCode::BAD_REQUEST,
+            "AWS.SimpleQueueService.PurgeQueueInProgress",
+        ),
+        LqsError::QueueDeletedRecently => (
+            StatusCode::BAD_REQUEST,
+            "AWS.SimpleQueueService.QueueDeletedRecently",
+        ),
         LqsError::QueueAlreadyExists(_) => (StatusCode::BAD_REQUEST, "QueueNameExists"),
         LqsError::QueueNotFound(_) => (
             StatusCode::BAD_REQUEST,

@@ -69,7 +69,7 @@ Rustでは`send_batch(queue, Vec<BatchEntry<SendRequest>>, now_ms)`、`delete_ba
 
 Rustでは`QueueOptions::redrive_policy`、`set_redrive_policy`、`redrive_policy`、`list_dead_letter_source_queues`を利用できます。再投入の基礎APIは`redrive_dead_letters(dlq, source, max_messages, now_ms)`です。元キューが一致する可視メッセージを新しいID・受信回数で元キューの末尾へ戻します。HTTPの非同期move-task APIは未実装です。
 
-属性管理は`RedrivePolicy`と下記の配信設定を扱います。`GetQueueAttributes`では`QueueArn`・`VisibilityTimeout`・FIFO設定と`All`も取得できます。タグなどのキュー管理機能は別途実装予定です。
+属性管理は`RedrivePolicy`と下記の配信設定を扱います。`GetQueueAttributes`では`QueueArn`・`VisibilityTimeout`・FIFO設定と`All`も取得できます。キュー管理・タグ操作については後述します。
 
 ## 遅延・保持期限・サイズ制限
 
@@ -141,6 +141,37 @@ FIFOの`ReceiveMessage.ReceiveRequestAttemptId`には1〜128文字のASCII英数
 既存DBは自動移行し、メッセージ・明示的な重複排除キーを保持します。旧設定の重複排除窓は5分へ統一します。旧FNVハッシュを使う履歴は明示IDと区別できないためSHA-256へ書き換えません。アップグレードをまたぐ本文ベースの再送は重複排除されない可能性があるため、送信を5分以上停止してから切り替えるか、明示IDを利用してください。旧履歴で削除済みメッセージのグループが不明なキーは、残りの有効期間だけ全グループに適用します。
 
 仕様参考: [FIFOの重複排除](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html)、[FIFO属性](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html)、[ReceiveMessage](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html)。
+
+## キュー管理・タグ・メトリクス
+
+JSON / Queryの両方で`ListQueues`、`GetQueueUrl`、`DeleteQueue`、`PurgeQueue`、`TagQueue`、`UntagQueue`、`ListQueueTags`を利用できます。
+
+`ListQueues`は名前順・大文字小文字を区別するリテラルの`QueueNamePrefix`検索です。`MaxResults`は1〜1,000で、明示した場合だけ続きの`NextToken`を返します。次のページにも同じprefixを指定してください。ページングは名前を基準とし、一覧全体のスナップショットではありません。`GetQueueUrl`は名前からURLを取得し、任意の`QueueOwnerAWSAccountId`はローカルの`000000000000`のみを受け付けます。
+
+`GetQueueAttributes`には以下も含まれます。属性を省略すると空、`All`は対応する全属性を返します。
+
+| 属性 | LQSでの意味 |
+| --- | --- |
+| `ApproximateNumberOfMessages` | 可視状態のメッセージ数（FIFOで先行メッセージにブロックされたものを含む） |
+| `ApproximateNumberOfMessagesNotVisible` | 可視性期限内のin-flight数 |
+| `ApproximateNumberOfMessagesDelayed` | 遅延期限前でin-flightではない件数 |
+| `FifoQueue` | FIFOは`true`、Standardは`false` |
+| `CreatedTimestamp` / `LastModifiedTimestamp` | 作成・設定更新のUnix秒 |
+
+メトリクスは保持期限切れを除いたSQLite上の即時集計です。AWSの非同期な近似更新は再現しません。旧DBで不明な作成・更新日時は0です。`SetQueueAttributes.VisibilityTimeout`は0〜43,200秒（既定30秒）で、受信済みの可視性期限は変更せず、次回の受信から適用します。設定変更とタグは再起動後も維持されます。IAMポリシー、KMS暗号化、RedriveAllowPolicy等の未対応設定はエラーにします。
+
+タグはキー1〜128文字・値0〜256文字のUnicode文字列です。Unicode英数字・空白と`_ . : / = + - @`を使え、`aws:`プレフィックスは使用できません。LQSの上限は1キュー50タグです（AWSでは50以下が推奨）。同名キーは上書き、存在しないキーの削除は成功し、不正な更新は全体を巻き戻します。`CreateQueue`の`tags`にも対応します。同名・同設定での再作成は既存タグを変更しないため、更新には`TagQueue`を使ってください。Query形式は`Tag.N.Key` / `Tag.N.Value`、`TagKey.N`です。
+
+### パージと削除の安全性
+
+どちらも破壊的な操作で、削除したメッセージは復元できません。HTTPでは`LQS_BASE_URL/000000000000/キュー名`または`/000000000000/キュー名`の正確な指定を要求します。末尾のスラッシュは許容しますが、別ホスト・別アカウント・クエリ文字列・キュー名だけのURLでは実行しません。
+
+- `PurgeQueue`は実行時点の対象キューの可視・in-flight・遅延メッセージを同一トランザクションで即時削除します。キュー設定・タグ・DLQ設定・送信重複排除キーは維持し、受信再試行の履歴を無効化します。別キューやDLQのメッセージ、パージ完了後の新規送信は削除しません。60秒以内の再パージは`AWS.SimpleQueueService.PurgeQueueInProgress`です。この待機時間も永続化します。AWSの最大60秒の非同期削除は再現しません。
+- `DeleteQueue`は対象キューとそのメッセージ・タグ・重複排除・受信再試行データを原子的に削除します。対象を参照するDLQポリシーは解除し、他キューに残るメッセージの元キュー参照は外しますが、他キュー内のメッセージそのものは残します。同名キューは60秒間再作成できず、`AWS.SimpleQueueService.QueueDeletedRecently`となります。削除自体は即時です。
+
+Rustでは`list_queues`、`queue_exists`、`queue_metrics`、`tag_queue`、`untag_queue`、`list_queue_tags`、`purge_queue`、`delete_queue`を利用できます。時刻を制御した作成・初期タグ設定には`create_queue_with_tags_at`を使用します。
+
+仕様参考: [ListQueues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ListQueues.html)、[PurgeQueue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_PurgeQueue.html)、[DeleteQueue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteQueue.html)、[タグ制約](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-queues.html)。
 
 ## テスト
 
