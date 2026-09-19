@@ -31,9 +31,21 @@ SQLite をDB層として使い、キュー定義・メッセージ・FIFO重複�
 
 HTTP層は `ServerConfig`、Axumルーター、SQLite-backed `Lqs`を分離しています。CLIは環境変数からサーバー設定を構築してSQLite接続を所有し、ルーターへ渡します。テストでは同じルーターへインメモリDBを注入できます。
 
-`CreateQueue`、`SendMessage`、`ReceiveMessage`、`DeleteMessage`、`ChangeMessageVisibility`を対象とし、AWS JSON 1.0のquery-compatible形式と従来のSQS Query形式を受け付けます。応答形式はリクエストのプロトコルに合わせ、すべての応答へリクエストIDを付与します。AWS署名は受け入れますが検証しません。
+`CreateQueue`、`SendMessage`、`ReceiveMessage`、`DeleteMessage`、`ChangeMessageVisibility`と送信・削除・可視性変更のバッチ操作を対象とし、AWS JSON 1.0のquery-compatible形式と従来のSQS Query形式を受け付けます。応答形式はリクエストのプロトコルに合わせ、すべての応答へリクエストIDを付与します。AWS署名は受け入れますが検証しません。
 
 サーバーからライブラリAPIへ渡す時刻にはUnix時刻のミリ秒を使い、SQLiteファイルを開き直した後も可視性期限を比較できるようにします。
+
+## バッチの検証とトランザクション境界
+
+ライブラリの3バッチAPIとHTTPアダプターは共通の`run_batch`を使います。件数（1〜10件）・ID形式と重複・キューの存在を先に検証し、送信ではデコード後の本文合計1 MiBも書き込み前に検証します。全体エラーは`EmptyBatchRequest`、`TooManyEntriesInBatchRequest`、`InvalidBatchEntryId`、`BatchEntryIdsNotDistinct`、`BatchRequestTooLong`などのHTTP 400です。
+
+全体の検証後は入力順に単体APIを呼び、本文サイズ・遅延・FIFO識別子・ハンドル・可視性期限などの不正をエントリー別に記録して次へ進みます。送信はエントリーごとのImmediateトランザクション、削除・可視性変更はエントリーごとの単一SQL文の自動コミットです。バッチ全体を1トランザクションにはしません。送信中に重複排除キー登録が失敗しても、その送信のメッセージ作成を含めロールバックし、前後の成功分は永続化します。DB障害は`SenderFault=false`、入力エラーは`true`として返します。プロセス停止や応答消失が起きた場合にはコミット済みの一部が残り得ます。
+
+HTTPはバッチ処理中に同一サーバーのMutexを保持し、他のHTTP操作がエントリー間に割り込みません。別プロセス・接続を含むバッチ全体の隔離は保証しません。JSONの`Entries`は配列順、Queryの`<Action>RequestEntry.N`はNの数値順で処理するため、10番目が2番目より先に入ることはありません。エントリーIDは応答との対応付け専用で、メッセージIDやFIFO重複排除キーとは独立です。
+
+JSONでは`Successful`/`Failed`、Queryでは`<Action>ResultEntry`/`BatchResultErrorEntry`を返します。送信成功には本文MD5とMessageId、FIFOにはSequenceNumberを含めます。単体送信とバッチ送信でFIFOの順序・重複排除ロジックを共有します。メッセージ属性と属性分のサイズ計算は#7の範囲です。
+
+仕様参照: [SendMessageBatch](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessageBatch.html)、[DeleteMessageBatch](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessageBatch.html)、[ChangeMessageVisibilityBatch](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ChangeMessageVisibilityBatch.html)。
 
 ## DLQと再投入
 

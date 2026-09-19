@@ -11,6 +11,10 @@ mod dlq_tests;
 #[path = "delivery_tests.rs"]
 mod delivery_tests;
 
+#[cfg(test)]
+#[path = "batch_tests.rs"]
+mod batch_tests;
+
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +139,8 @@ pub enum LqsError {
     InvalidRedrivePolicy(String),
     InvalidDeliveryOptions(String),
     InvalidMessageSize { size: usize, maximum: usize },
+    InvalidBatch(&'static str),
+    InvalidMessageIdentifier(&'static str),
     Database(String),
 }
 
@@ -158,6 +164,11 @@ impl fmt::Display for LqsError {
                 write!(f, "visibility timeout must be greater than zero")
             }
             Self::Database(message) => write!(f, "database error: {message}"),
+            Self::InvalidBatch(code) => write!(f, "invalid batch request: {code}"),
+            Self::InvalidMessageIdentifier(name) => write!(
+                f,
+                "{name} must be 1-128 ASCII letters, digits or punctuation characters"
+            ),
             Self::InvalidRedrivePolicy(message) => write!(f, "invalid redrive policy: {message}"),
             Self::InvalidDeliveryOptions(message) => {
                 write!(f, "invalid delivery options: {message}")
@@ -358,6 +369,17 @@ impl Lqs {
                 Some(group)
             }
         };
+        for (name, value) in [
+            ("MessageGroupId", group_id.as_deref()),
+            ("MessageDeduplicationId", deduplication_id.as_deref()),
+        ] {
+            if let Some(value) = value
+                && (!(1..=128).contains(&value.len())
+                    || !value.bytes().all(|b| b.is_ascii_graphic()))
+            {
+                return Err(LqsError::InvalidMessageIdentifier(name));
+            }
+        }
         expire_messages(&transaction, queue_name, ms(now_ms))?;
         let deduplication_id = if config.queue_type == QueueType::Fifo {
             let key = match deduplication_id {
@@ -483,6 +505,11 @@ impl Lqs {
         timeout_ms: u64,
         now_ms: u64,
     ) -> Result<(), LqsError> {
+        if timeout_ms > 43_200_000 {
+            return Err(LqsError::InvalidDeliveryOptions(
+                "visibility timeout must be 0-43200000ms".into(),
+            ));
+        }
         self.queue_config(queue_name)?;
         let count = self.connection.execute(
             "UPDATE messages SET invisible_until_ms = ?1 WHERE queue_name = ?2 AND receipt_handle = ?3",

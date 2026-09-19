@@ -17,7 +17,7 @@ curl http://127.0.0.1:9324/health
 | `LQS_BASE_URL` | 待ち受けアドレスから生成 | Queue URLに使用する公開URL |
 | `LQS_DATABASE_PATH` | `lqs.sqlite` | SQLiteファイル |
 
-`CreateQueue`、`SendMessage`、`ReceiveMessage`、`DeleteMessage`、`ChangeMessageVisibility`をサポートします。現行AWS SDKが使用するJSON形式と、`Action=...`を送るSQS Query形式の両方を受け付けます。成功応答、エラーコード、リクエストIDはSQS互換形式で返します。署名は検証しないため、ローカル用のダミー認証情報を利用できます。
+`CreateQueue`、`SendMessage`、`ReceiveMessage`、`DeleteMessage`、`ChangeMessageVisibility`と、送信・削除・可視性変更のバッチ操作をサポートします。現行AWS SDKが使用するJSON形式と、`Action=...`を送るSQS Query形式の両方を受け付けます。成功応答、エラーコード、リクエストIDはSQS互換形式で返します。署名は検証しないため、ローカル用のダミー認証情報を利用できます。
 
 ## Rustライブラリ
 
@@ -44,6 +44,16 @@ lqs.delete("orders.fifo", &message.receipt_handle)?;
 `Lqs::open(path)` は指定されたSQLiteファイルを開き、必要なテーブルと索引を自動作成します。`Lqs::new()` / `Lqs::in_memory()` はテスト用の一時DBです。
 
 時刻を引数 `now_ms` として渡すため、可視性タイムアウトと FIFO 重複排除をテストで再現できます。設計と制約は [DESIGN.md](DESIGN.md) を参照してください。
+
+## バッチ操作
+
+`SendMessageBatch`、`DeleteMessageBatch`、`ChangeMessageVisibilityBatch`は1〜10件を処理します。各エントリーの`Id`は1〜80文字の英数字・`-`・`_`で、バッチ内で一意にします。送信本文の合計はUTF-8で最大1 MiBです。
+
+件数・ID・合計サイズが不正な場合はHTTP 400となり、何も変更しません。それ以外のエントリー単位の失敗はHTTP 200の`Failed`へ、成功は`Successful`へ返します。**HTTP 200でも必ず`Failed`を確認してください。** エラーには`Id`・`Code`・`Message`・`SenderFault`が含まれます。
+
+FIFOは入力順で処理し、単体送信と同じ重複排除を適用します。グループID・明示的な重複排除IDは1〜128文字のASCII英数字・記号です。成功エントリーごとにコミットするため、途中の失敗で他の成功分が取り消されることはありません。
+
+Rustでは`send_batch(queue, Vec<BatchEntry<SendRequest>>, now_ms)`、`delete_batch(queue, Vec<BatchEntry<String>>)`、`change_visibility_batch(queue, Vec<BatchEntry<VisibilityChange>>, now_ms)`を利用できます。`BatchEntry`は`id`と`value`、戻り値の`BatchResult`は`successful`と`failed`を持ちます。`VisibilityChange`には`receipt_handle`と`timeout_ms`（0〜43,200,000ミリ秒）を指定します。
 
 ## DLQ（Dead-letter queue）
 
@@ -92,3 +102,4 @@ LQS_ENDPOINT=http://127.0.0.1:9324 go test -v ./...
 GitHub ActionsではRustの整形・Clippy・単体テストに続けてLQSサーバーを起動し、Go SDKからFIFOキューの作成、送信、受信、可視性変更、削除、エラーコードの復元を検証します。
 DLQについてもStandard/FIFOの転送、属性設定・取得、ソース一覧のページング、ポリシー解除、不正設定時のHTTP 400を同じCIで検証します。
 遅延・1 MiB本文・設定上限・UTF-8サイズ・保持期限もGo SDKから検証します。保持期限テストはSQSの最短設定60秒を実時間で検証するため、結合テスト全体は約1分以上かかります。
+バッチ3操作の部分成功、全体エラー、FIFO順序・重複排除、Queryの数値順・XMLエラーも検証します。RustテストではDB障害の注入と再起動後の永続化も確認します。
