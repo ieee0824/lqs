@@ -28,6 +28,17 @@ curl --fail http://127.0.0.1:9324/ \
 
 既定では `127.0.0.1:9324` で待ち受け、カレントディレクトリの `lqs.sqlite` に保存します。停止・再起動後もデータは残ります。
 
+### Docker で起動する
+
+```bash
+docker build -t lqs .
+docker run --rm --name lqs -p 127.0.0.1:9324:9324 -v lqs-data:/data lqs
+```
+
+別ターミナルから `curl --fail http://127.0.0.1:9324/health` で確認できます。SQLite のデータは Docker ボリューム `lqs-data` に保存されます。コンテナ内では `0.0.0.0:9324` で待ち受けますが、上記の公開ポートはホストのローカル接続に限定されます。
+
+Docker イメージの `LQS_BASE_URL` はホストから使う `http://127.0.0.1:9324` に設定しています。別のコンテナから Queue URL を使う場合は、`docker run -e LQS_BASE_URL=http://<接続可能なホスト名>:9324 ...` でクライアントから到達できる URL に変更してください。
+
 ### AWS SDK から接続する
 
 SDK の SQS クライアントに以下を設定してください。JSON / SQS Query の両形式を受け付けます。
