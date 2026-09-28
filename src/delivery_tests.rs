@@ -206,7 +206,7 @@ fn fifo_queue_delay_preserves_group_order_and_rejects_overrides() {
     lqs.send("q.fifo", SendRequest::fifo("a1", "a"), 0).unwrap();
     lqs.send("q.fifo", SendRequest::fifo("a2", "a"), 1).unwrap();
     assert!(lqs.receive("q.fifo", 10, 999).unwrap().is_empty());
-    let first = lqs.receive("q.fifo", 10, 1001).unwrap();
+    let first = lqs.receive("q.fifo", 1, 1001).unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].body, "a1");
     lqs.delete("q.fifo", &first[0].receipt_handle).unwrap();

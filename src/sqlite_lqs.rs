@@ -1281,9 +1281,18 @@ fn collect_received(
     now: i64,
 ) -> Result<Vec<ReceivedMessage>, LqsError> {
     let mut received = Vec::with_capacity(limit);
+    let mut selected_sequences = Vec::with_capacity(limit);
+    let mut preferred_group: Option<String> = None;
     let policy = read_redrive_policy(transaction, queue_name)?;
     while received.len() < limit {
-        let Some(candidate) = next_receivable(transaction, queue_name, config.queue_type, now)?
+        let Some(candidate) = next_receivable(
+            transaction,
+            queue_name,
+            config.queue_type,
+            now,
+            &selected_sequences,
+            preferred_group.as_deref(),
+        )?
         else {
             break;
         };
@@ -1299,13 +1308,22 @@ fn collect_received(
                     now,
                 )?;
             }
-            CandidateAction::Deliver => received.push(deliver_candidate(
-                transaction,
-                config.queue_type,
-                candidate,
-                visibility_ms,
-                now,
-            )?),
+            CandidateAction::Deliver => {
+                let sequence = candidate.sequence;
+                let group = candidate.group_id.clone();
+                let message = deliver_candidate(
+                    transaction,
+                    config.queue_type,
+                    candidate,
+                    visibility_ms,
+                    now,
+                )?;
+                if config.queue_type == QueueType::Fifo {
+                    selected_sequences.push(sequence);
+                    preferred_group = group;
+                }
+                received.push(message);
+            }
         }
     }
     Ok(received)
@@ -1368,17 +1386,36 @@ fn next_receivable(
     queue_name: &str,
     queue_type: QueueType,
     now: i64,
+    selected_sequences: &[i64],
+    preferred_group: Option<&str>,
 ) -> Result<Option<Candidate>, LqsError> {
-    let sql = match queue_type {
-        QueueType::Standard => {
-            "SELECT sequence, message_id, body, group_id, receive_count FROM messages WHERE queue_name = ?1 AND available_at_ms <= ?2 AND (invisible_until_ms IS NULL OR invisible_until_ms <= ?2) ORDER BY sequence LIMIT 1"
-        }
+    let (sql, parameters) = match queue_type {
+        QueueType::Standard => (
+            "SELECT sequence, message_id, body, group_id, receive_count FROM messages WHERE queue_name = ?1 AND available_at_ms <= ?2 AND (invisible_until_ms IS NULL OR invisible_until_ms <= ?2) ORDER BY sequence LIMIT 1".to_owned(),
+            vec![
+                rusqlite::types::Value::Text(queue_name.to_owned()),
+                rusqlite::types::Value::Integer(now),
+            ],
+        ),
         QueueType::Fifo => {
-            "SELECT message.sequence, message.message_id, message.body, message.group_id, message.receive_count FROM messages AS message WHERE message.queue_name = ?1 AND message.available_at_ms <= ?2 AND (message.invisible_until_ms IS NULL OR message.invisible_until_ms <= ?2) AND NOT EXISTS (SELECT 1 FROM messages AS earlier WHERE earlier.queue_name = message.queue_name AND earlier.group_id = message.group_id AND earlier.sequence < message.sequence) ORDER BY message.sequence LIMIT 1"
+            let mut parameters = vec![
+                rusqlite::types::Value::Text(queue_name.to_owned()),
+                rusqlite::types::Value::Integer(now),
+                preferred_group
+                    .map(|group| rusqlite::types::Value::Text(group.to_owned()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            ];
+            parameters.extend(
+                selected_sequences
+                    .iter()
+                    .copied()
+                    .map(rusqlite::types::Value::Integer),
+            );
+            (fifo_candidate_sql(selected_sequences.len()), parameters)
         }
     };
     transaction
-        .query_row(sql, params![queue_name, now], |row| {
+        .query_row(&sql, rusqlite::params_from_iter(parameters.iter()), |row| {
             Ok(Candidate {
                 sequence: row.get(0)?,
                 message_id: row.get(1)?,
@@ -1389,6 +1426,38 @@ fn next_receivable(
         })
         .optional()
         .map_err(Into::into)
+}
+
+fn fifo_candidate_sql(selected_count: usize) -> String {
+    // Only messages claimed by this receive call may be ignored as earlier group members.
+    let placeholders = (4..4 + selected_count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let exclude_selected = if placeholders.is_empty() {
+        String::new()
+    } else {
+        format!(" AND message.sequence NOT IN ({placeholders})")
+    };
+    let exclude_earlier_selected = if placeholders.is_empty() {
+        String::new()
+    } else {
+        format!(" AND earlier.sequence NOT IN ({placeholders})")
+    };
+    format!(
+        "SELECT message.sequence, message.message_id, message.body, message.group_id, message.receive_count
+         FROM messages AS message
+         WHERE message.queue_name = ?1 AND message.available_at_ms <= ?2
+         AND (message.invisible_until_ms IS NULL OR message.invisible_until_ms <= ?2)
+         {exclude_selected}
+         AND NOT EXISTS (SELECT 1 FROM messages AS earlier
+             WHERE earlier.queue_name = message.queue_name
+             AND earlier.group_id = message.group_id
+             AND earlier.sequence < message.sequence
+             {exclude_earlier_selected})
+         ORDER BY CASE WHEN message.group_id = ?3 THEN 0 ELSE 1 END, message.sequence
+         LIMIT 1"
+    )
 }
 
 fn ms(value: u64) -> i64 {
@@ -1562,7 +1631,7 @@ mod tests {
         assert_eq!(first[0].body, "a-1");
 
         let transaction = lqs.connection.transaction().unwrap();
-        let candidate = next_receivable(&transaction, "orders.fifo", QueueType::Fifo, 3)
+        let candidate = next_receivable(&transaction, "orders.fifo", QueueType::Fifo, 3, &[], None)
             .unwrap()
             .unwrap();
         assert_eq!(candidate.body, "b-1");
@@ -1622,10 +1691,11 @@ mod tests {
         let first = lqs.receive("orders.fifo", 10, 3).unwrap();
         assert_eq!(
             first.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
-            ["a-1", "b-1"]
+            ["a-1", "a-2", "b-1"]
         );
+        assert!(lqs.receive("orders.fifo", 10, 4).unwrap().is_empty());
         lqs.delete("orders.fifo", &first[0].receipt_handle).unwrap();
-        assert_eq!(lqs.receive("orders.fifo", 10, 4).unwrap()[0].body, "a-2");
+        assert!(lqs.receive("orders.fifo", 10, 4).unwrap().is_empty());
     }
 
     #[test]

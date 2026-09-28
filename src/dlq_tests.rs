@@ -87,11 +87,9 @@ fn fifo_moves_only_the_head_and_appends_to_destination() {
     // A newer destination message must remain ahead of the older source message.
     lqs.send(dlq, SendRequest::fifo("already-dead", "a"), 0)
         .unwrap();
-    let received = lqs.receive(source, 10, 0).unwrap();
-    assert_eq!(
-        received.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
-        ["a1", "b1"]
-    );
+    let a1 = lqs.receive(source, 1, 0).unwrap();
+    let b1 = lqs.receive(source, 1, 0).unwrap();
+    assert_eq!((a1[0].body.as_str(), b1[0].body.as_str()), ("a1", "b1"));
     assert!(lqs.receive(source, 10, 1).unwrap().is_empty());
     let next = lqs.receive(source, 10, 10).unwrap();
     assert_eq!(
@@ -101,10 +99,10 @@ fn fifo_moves_only_the_head_and_appends_to_destination() {
     let dead = lqs.receive(dlq, 10, 10).unwrap();
     assert_eq!(
         dead.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
-        ["already-dead", "b1"]
+        ["already-dead", "a1", "b1"]
     );
     lqs.delete(dlq, &dead[0].receipt_handle).unwrap();
-    assert_eq!(lqs.receive(dlq, 10, 11).unwrap()[0].body, "a1");
+    assert!(lqs.receive(dlq, 10, 11).unwrap().is_empty());
 }
 
 #[test]
@@ -217,7 +215,7 @@ fn redrive_preserves_origin_isolation_and_resets_identity_and_retries() {
     assert_eq!(lqs.redrive_dead_letters(dlq, source, 0, 12).unwrap(), 0);
     assert_eq!(lqs.redrive_dead_letters(dlq, source, 10, 12).unwrap(), 1);
     assert_eq!(lqs.queue_depth(dlq).unwrap(), 2);
-    let newer = lqs.receive(source, 10, 13).unwrap().remove(0);
+    let newer = lqs.receive(source, 1, 13).unwrap().remove(0);
     assert_eq!(newer.body, "newer");
     lqs.delete(source, &newer.receipt_handle).unwrap();
     let redriven = lqs.receive(source, 10, 13).unwrap().remove(0);

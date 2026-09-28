@@ -158,7 +158,7 @@ func TestSDKBatchFIFOOrderAndDeduplication(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, body := range []string{"one", "two"} {
-		out, err := client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{QueueUrl: queue, MaxNumberOfMessages: 10})
+		out, err := client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{QueueUrl: queue, MaxNumberOfMessages: 1})
 		if err != nil || len(out.Messages) != 1 || aws.ToString(out.Messages[0].Body) != body {
 			t.Fatalf("FIFO order: %+v %v", out, err)
 		}
@@ -232,7 +232,7 @@ func TestQueryBatchOperationsAndNumericOrder(t *testing.T) {
 		if i == 5 {
 			continue
 		}
-		out, err := client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{QueueUrl: queue, MaxNumberOfMessages: 10})
+		out, err := client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{QueueUrl: queue, MaxNumberOfMessages: 1})
 		if err != nil || len(out.Messages) != 1 || aws.ToString(out.Messages[0].Body) != fmt.Sprintf("body-%d<&>", i) {
 			t.Fatalf("query FIFO order: %+v %v", out, err)
 		}
