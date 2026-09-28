@@ -207,41 +207,51 @@ async fn handle_request(State(mut state): State<AppState>, request: Request) -> 
         )
         .into_response(Protocol::Query, &request_id);
     }
+    let (protocol, result) = process_post(&mut state, request).await;
+    match result {
+        Ok(success) => success.into_response(protocol, &request_id),
+        Err(error) => error.into_response(protocol, &request_id),
+    }
+}
 
+async fn process_post(
+    state: &mut AppState,
+    request: Request,
+) -> (Protocol, Result<ApiSuccess, ApiError>) {
     let path = request.uri().path().to_owned();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
+    let fallback_protocol = protocol_from_headers(&headers);
     let body = match to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
         Ok(body) => body,
         Err(_) => {
-            return ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "InvalidParameterValue",
-                "request body is too large",
-            )
-            .into_response(protocol_from_headers(&headers), &request_id);
+            return (
+                fallback_protocol,
+                Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidParameterValue",
+                    "request body is too large",
+                )),
+            );
         }
     };
     let wire_request = match WireRequest::parse(&headers, body.clone()) {
         Ok(request) => request,
         Err(error) => {
-            return error.into_response(protocol_from_headers(&headers), &request_id);
+            return (fallback_protocol, Err(error));
         }
     };
     let protocol = wire_request.protocol;
-    match security_http::access_context(&state, &path, &wire_request, headers, uri, body) {
+    match security_http::access_context(state, &path, &wire_request, headers, uri, body) {
         Ok(access) => state.access = Some(access),
-        Err(error) => return error.into_response(protocol, &request_id),
+        Err(error) => return (protocol, Err(error)),
     }
     let result = if wire_request.action == "ReceiveMessage" {
-        receive_message(&state, &path, &wire_request).await
+        receive_message(state, &path, &wire_request).await
     } else {
-        dispatch(&state, &path, wire_request)
+        dispatch(state, &path, wire_request)
     };
-    match result {
-        Ok(success) => success.into_response(protocol, &request_id),
-        Err(error) => error.into_response(protocol, &request_id),
-    }
+    (protocol, result)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,66 +363,74 @@ impl WireRequest {
 
     fn attributes(&self) -> Result<HashMap<String, String>, ApiError> {
         if let Some(attributes) = self.json.as_ref().and_then(|value| value.get("Attributes")) {
-            let attributes = attributes
-                .as_object()
-                .ok_or_else(|| ApiError::invalid_parameter("Attributes", "must be a string map"))?;
-            return attributes
-                .iter()
-                .map(|(name, value)| {
-                    value
-                        .as_str()
-                        .map(|value| (name.clone(), value.to_owned()))
-                        .ok_or_else(|| {
-                            ApiError::invalid_parameter(name, "attribute value must be a string")
-                        })
-                })
-                .collect();
+            return json_queue_attributes(attributes);
         }
-
-        let mut entries =
-            std::collections::BTreeMap::<String, (Option<String>, Option<String>)>::new();
-        for (key, value) in &self.query {
-            let Some(rest) = key.strip_prefix("Attribute.") else {
-                continue;
-            };
-            let (index, field) = if matches!(rest, "Name" | "Value") {
-                ("1", rest)
-            } else {
-                rest.split_once('.')
-                    .ok_or_else(|| ApiError::invalid_parameter("Attributes", "invalid entry"))?
-            };
-            if index
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n > 0 && n.to_string() == index)
-                .is_none()
-                || !matches!(field, "Name" | "Value")
-            {
-                return Err(ApiError::invalid_parameter("Attributes", "invalid entry"));
-            }
-            let entry = entries.entry(index.into()).or_default();
-            let slot = if field == "Name" {
-                &mut entry.0
-            } else {
-                &mut entry.1
-            };
-            if slot.replace(value.clone()).is_some() {
-                return Err(ApiError::invalid_parameter("Attributes", "duplicate field"));
-            }
-        }
-        let mut attributes = HashMap::new();
-        for (_, (name, value)) in entries {
-            let name = name.ok_or_else(|| ApiError::missing("Attribute.Name"))?;
-            let value = value.ok_or_else(|| ApiError::missing("Attribute.Value"))?;
-            if attributes.insert(name, value).is_some() {
-                return Err(ApiError::invalid_parameter(
-                    "Attributes",
-                    "duplicate attribute",
-                ));
-            }
-        }
-        Ok(attributes)
+        query_queue_attributes(&self.query)
     }
+}
+
+fn json_queue_attributes(value: &Value) -> Result<HashMap<String, String>, ApiError> {
+    let attributes = value
+        .as_object()
+        .ok_or_else(|| ApiError::invalid_parameter("Attributes", "must be a string map"))?;
+    attributes
+        .iter()
+        .map(|(name, value)| {
+            value
+                .as_str()
+                .map(|value| (name.clone(), value.to_owned()))
+                .ok_or_else(|| {
+                    ApiError::invalid_parameter(name, "attribute value must be a string")
+                })
+        })
+        .collect()
+}
+
+fn query_queue_attributes(
+    query: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, ApiError> {
+    let mut entries = std::collections::BTreeMap::<String, (Option<String>, Option<String>)>::new();
+    for (key, value) in query {
+        let Some(rest) = key.strip_prefix("Attribute.") else {
+            continue;
+        };
+        let (index, field) = if matches!(rest, "Name" | "Value") {
+            ("1", rest)
+        } else {
+            rest.split_once('.')
+                .ok_or_else(|| ApiError::invalid_parameter("Attributes", "invalid entry"))?
+        };
+        if index
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0 && n.to_string() == index)
+            .is_none()
+            || !matches!(field, "Name" | "Value")
+        {
+            return Err(ApiError::invalid_parameter("Attributes", "invalid entry"));
+        }
+        let entry = entries.entry(index.into()).or_default();
+        let slot = if field == "Name" {
+            &mut entry.0
+        } else {
+            &mut entry.1
+        };
+        if slot.replace(value.clone()).is_some() {
+            return Err(ApiError::invalid_parameter("Attributes", "duplicate field"));
+        }
+    }
+    let mut attributes = HashMap::new();
+    for (_, (name, value)) in entries {
+        let name = name.ok_or_else(|| ApiError::missing("Attribute.Name"))?;
+        let value = value.ok_or_else(|| ApiError::missing("Attribute.Value"))?;
+        if attributes.insert(name, value).is_some() {
+            return Err(ApiError::invalid_parameter(
+                "Attributes",
+                "duplicate attribute",
+            ));
+        }
+    }
+    Ok(attributes)
 }
 
 enum ApiSuccess {
@@ -682,6 +700,28 @@ fn dispatch(state: &AppState, path: &str, request: WireRequest) -> Result<ApiSuc
 }
 
 fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, ApiError> {
+    let (name, queue_type, options, tags) = parse_create_queue(request)?;
+    let mut lqs = lock_lqs(state)?;
+    if let Err(error) =
+        lqs.create_queue_with_tags_at(&name, queue_type, options.clone(), tags, unix_time_ms())
+    {
+        let same_configuration = matches!(&error, LqsError::QueueAlreadyExists(_))
+            && lqs
+                .queue_config(&name)
+                .map(|existing| same_queue_configuration(&existing, queue_type, &options))
+                .unwrap_or(false);
+        if !same_configuration {
+            return Err(map_lqs_error(error));
+        }
+    }
+    Ok(ApiSuccess::CreateQueue {
+        queue_url: format!("{}/000000000000/{name}", state.public_base_url),
+    })
+}
+
+fn parse_create_queue(
+    request: &WireRequest,
+) -> Result<(String, QueueType, QueueOptions, crate::QueueTags), ApiError> {
     let name = request.required_string("QueueName")?;
     validate_queue_name(name)?;
     let attributes = request.attributes()?;
@@ -742,37 +782,27 @@ fn create_queue(state: &AppState, request: &WireRequest) -> Result<ApiSuccess, A
             .unwrap_or(QueueOptions::default().max_in_flight),
         ..QueueOptions::default()
     };
-    let mut lqs = lock_lqs(state)?;
-    if let Err(error) =
-        lqs.create_queue_with_tags_at(name, queue_type, options.clone(), tags, unix_time_ms())
-    {
-        let same_configuration = matches!(&error, LqsError::QueueAlreadyExists(_))
-            && lqs
-                .queue_config(name)
-                .map(|existing| {
-                    existing.queue_type == queue_type
-                        && existing.visibility_timeout_ms == options.visibility_timeout_ms
-                        && existing.content_based_deduplication
-                            == options.content_based_deduplication
-                        && existing.deduplication_window_ms == options.deduplication_window_ms
-                        && existing.redrive_policy == options.redrive_policy
-                        && existing.delay_ms == options.delay_ms
-                        && existing.message_retention_ms == options.message_retention_ms
-                        && existing.maximum_message_size == options.maximum_message_size
-                        && existing.receive_wait_time_ms == options.receive_wait_time_ms
-                        && existing.max_in_flight == options.max_in_flight
-                        && existing.deduplication_scope == options.deduplication_scope
-                        && existing.fifo_throughput_limit == options.fifo_throughput_limit
-                        && existing.security == options.security
-                })
-                .unwrap_or(false);
-        if !same_configuration {
-            return Err(map_lqs_error(error));
-        }
-    }
-    Ok(ApiSuccess::CreateQueue {
-        queue_url: format!("{}/000000000000/{name}", state.public_base_url),
-    })
+    Ok((name.to_owned(), queue_type, options, tags))
+}
+
+fn same_queue_configuration(
+    existing: &crate::sqlite_lqs::QueueConfig,
+    queue_type: QueueType,
+    options: &QueueOptions,
+) -> bool {
+    existing.queue_type == queue_type
+        && existing.visibility_timeout_ms == options.visibility_timeout_ms
+        && existing.content_based_deduplication == options.content_based_deduplication
+        && existing.deduplication_window_ms == options.deduplication_window_ms
+        && existing.redrive_policy == options.redrive_policy
+        && existing.delay_ms == options.delay_ms
+        && existing.message_retention_ms == options.message_retention_ms
+        && existing.maximum_message_size == options.maximum_message_size
+        && existing.receive_wait_time_ms == options.receive_wait_time_ms
+        && existing.max_in_flight == options.max_in_flight
+        && existing.deduplication_scope == options.deduplication_scope
+        && existing.fifo_throughput_limit == options.fifo_throughput_limit
+        && existing.security == options.security
 }
 
 // LQS is a single-account, single-region local service.
@@ -903,6 +933,14 @@ fn get_queue_attributes(
     let lqs = lock_lqs(state)?;
     let config = lqs.queue_config(&name).map_err(map_lqs_error)?;
     let metrics = lqs.queue_metrics(&name, unix_time_ms())?;
+    let names = requested_attribute_names(request)?;
+    let attributes = queue_attributes(&name, &config, &metrics);
+    Ok(ApiSuccess::GetQueueAttributes {
+        attributes: select_queue_attributes(attributes, &names)?,
+    })
+}
+
+fn requested_attribute_names(request: &WireRequest) -> Result<Vec<&str>, ApiError> {
     let names: Vec<&str> = if let Some(json) = &request.json {
         match json.get("AttributeNames") {
             None => Vec::new(),
@@ -929,6 +967,14 @@ fn get_queue_attributes(
             .map(|(_, value)| value.as_str())
             .collect()
     };
+    Ok(names)
+}
+
+fn queue_attributes(
+    name: &str,
+    config: &crate::sqlite_lqs::QueueConfig,
+    metrics: &crate::QueueMetrics,
+) -> HashMap<String, String> {
     let mut attributes = HashMap::from([
         ("QueueArn".to_owned(), format!("{QUEUE_ARN_PREFIX}{name}")),
         (
@@ -996,7 +1042,7 @@ fn get_queue_attributes(
             config.content_based_deduplication.to_string(),
         );
     }
-    if let Some(policy) = config.redrive_policy {
+    if let Some(policy) = &config.redrive_policy {
         attributes.insert(
             "RedrivePolicy".into(),
             json!({
@@ -1006,7 +1052,14 @@ fn get_queue_attributes(
             .to_string(),
         );
     }
-    for name in &names {
+    attributes
+}
+
+fn select_queue_attributes(
+    mut attributes: HashMap<String, String>,
+    names: &[&str],
+) -> Result<HashMap<String, String>, ApiError> {
+    for name in names {
         if ![
             "All",
             "QueueArn",
@@ -1043,7 +1096,7 @@ fn get_queue_attributes(
     if !names.contains(&"All") {
         attributes.retain(|key, _| names.contains(&key.as_str()));
     }
-    Ok(ApiSuccess::GetQueueAttributes { attributes })
+    Ok(attributes)
 }
 
 fn list_dead_letter_source_queues(
@@ -1144,6 +1197,27 @@ async fn receive_message(
     path: &str,
     request: &WireRequest,
 ) -> Result<ApiSuccess, ApiError> {
+    let parsed = parse_receive_request(path, request)?;
+    let wait_ms = parsed.requested_wait_ms.unwrap_or(
+        lock_lqs(state)?
+            .queue_config(&parsed.queue_name)?
+            .receive_wait_time_ms,
+    );
+    poll_receive(state, &parsed, wait_ms).await
+}
+
+struct ParsedReceiveRequest {
+    queue_name: String,
+    max_messages: usize,
+    selection: attributes_http::Selection,
+    options: crate::ReceiveOptions,
+    requested_wait_ms: Option<u64>,
+}
+
+fn parse_receive_request(
+    path: &str,
+    request: &WireRequest,
+) -> Result<ParsedReceiveRequest, ApiError> {
     let queue_name = queue_name(path, request)?;
     let max_messages = request.unsigned("MaxNumberOfMessages")?.unwrap_or(1);
     let selection = attributes_http::Selection::parse(request)?;
@@ -1173,19 +1247,28 @@ async fn receive_message(
             "must be between 0 and 20",
         ));
     }
-    let wait_ms = requested_wait.map(|seconds| seconds * 1000).unwrap_or(
-        lock_lqs(state)?
-            .queue_config(&queue_name)?
-            .receive_wait_time_ms,
-    );
+    Ok(ParsedReceiveRequest {
+        queue_name,
+        max_messages: max_messages as usize,
+        selection,
+        options,
+        requested_wait_ms: requested_wait.map(|seconds| seconds * 1000),
+    })
+}
+
+async fn poll_receive(
+    state: &AppState,
+    parsed: &ParsedReceiveRequest,
+    wait_ms: u64,
+) -> Result<ApiSuccess, ApiError> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
     loop {
         // Neither the Mutex nor the SQLite transaction lives across the await below.
         let result = {
             lock_lqs(state)?.receive_page(
-                &queue_name,
-                max_messages as usize,
-                &options,
+                &parsed.queue_name,
+                parsed.max_messages,
+                &parsed.options,
                 unix_time_ms(),
                 tokio::time::Instant::now() >= deadline,
             )
@@ -1193,7 +1276,7 @@ async fn receive_message(
         match result {
             Ok((mut messages, true)) => {
                 for message in &mut messages {
-                    selection.apply(message);
+                    parsed.selection.apply(message);
                 }
                 return Ok(ApiSuccess::ReceiveMessage { messages });
             }
@@ -1433,6 +1516,36 @@ mod tests {
         assert_eq!(
             request.attributes().unwrap().get("FifoQueue").unwrap(),
             "true"
+        );
+    }
+
+    #[test]
+    fn attribute_selection_is_pure_and_rejects_unknown_names() {
+        let all = HashMap::from([
+            ("QueueArn".to_owned(), "arn".to_owned()),
+            ("VisibilityTimeout".to_owned(), "30".to_owned()),
+        ]);
+        assert_eq!(
+            select_queue_attributes(all.clone(), &["VisibilityTimeout"]).unwrap(),
+            HashMap::from([("VisibilityTimeout".to_owned(), "30".to_owned())])
+        );
+        assert_eq!(select_queue_attributes(all.clone(), &["All"]).unwrap(), all);
+        assert_eq!(
+            select_queue_attributes(all, &["Unknown"]).unwrap_err().code,
+            "InvalidAttributeName"
+        );
+    }
+
+    #[test]
+    fn receive_request_validation_needs_no_server() {
+        let request = WireRequest::parse(
+            &HeaderMap::new(),
+            Bytes::from_static(b"Action=ReceiveMessage&QueueUrl=http%3A%2F%2Flocalhost%3A9324%2F000000000000%2Fq&MaxNumberOfMessages=11"),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_receive_request("/", &request).err().unwrap().code,
+            "InvalidParameterValue"
         );
     }
 
