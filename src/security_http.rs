@@ -1,5 +1,6 @@
 use super::*;
 use crate::{QueueSecurity, RequestIdentity, SecurityUpdate};
+use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 #[path = "security_http_tests.rs"]
@@ -37,6 +38,35 @@ pub(super) fn local_hook(trust_header: bool) -> Arc<AuthorizationHook> {
             return Err(LqsError::AccessDenied);
         }
         RequestIdentity::aws(values[0].to_str().map_err(|_| LqsError::AccessDenied)?)
+    })
+}
+
+pub(super) fn bearer_hook(credential: &str, principal: &str) -> Arc<AuthorizationHook> {
+    let expected = Sha256::digest(credential.as_bytes());
+    let identity =
+        RequestIdentity::aws(principal).expect("validated server authentication principal");
+    Arc::new(move |request| {
+        if request.headers.contains_key("x-lqs-principal") {
+            return Err(LqsError::AccessDenied);
+        }
+        let mut values = request.headers.get_all(header::AUTHORIZATION).iter();
+        let value = values.next().ok_or(LqsError::AccessDenied)?;
+        if values.next().is_some() {
+            return Err(LqsError::AccessDenied);
+        }
+        let value = value.to_str().map_err(|_| LqsError::AccessDenied)?;
+        let candidate = value
+            .strip_prefix("Bearer ")
+            .ok_or(LqsError::AccessDenied)?;
+        let actual = Sha256::digest(candidate.as_bytes());
+        let equal = expected
+            .iter()
+            .zip(actual.iter())
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right));
+        if equal != 0 {
+            return Err(LqsError::AccessDenied);
+        }
+        Ok(identity.clone())
     })
 }
 

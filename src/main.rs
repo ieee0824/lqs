@@ -20,6 +20,9 @@ async fn main() {
             "WARNING: x-lqs-principal is self-asserted and trusted for local simulation only."
         );
     }
+    if config.allow_unauthenticated_remote && config.bearer_credential.is_none() {
+        eprintln!("WARNING: accepting unauthenticated requests on a non-loopback interface.");
+    }
     eprintln!("SSE/KMS settings are configuration-only; SQLite payloads remain plaintext.");
     if let Err(error) = serve(config).await {
         eprintln!("LQS server failed: {error}");

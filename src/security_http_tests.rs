@@ -58,6 +58,179 @@ async fn call(
     (status, serde_json::from_slice(&body).unwrap())
 }
 
+async fn bearer_call(
+    app: Router,
+    action: &str,
+    value: Value,
+    authorization: &[&str],
+    principal_header: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("x-amz-target", format!("AmazonSQS.{action}"));
+    for value in authorization {
+        request = request.header(header::AUTHORIZATION, *value);
+    }
+    if let Some(principal) = principal_header {
+        request = request.header("x-lqs-principal", principal);
+    }
+    let response = app
+        .oneshot(request.body(Body::from(value.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), MAX_REQUEST_BYTES)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn bearer_auth_covers_global_and_queue_operations_without_unauthorized_mutations() {
+    let credential = "1234567890abcdefghijklmnopqrstuv";
+    let good = format!("Bearer {credential}");
+    let app = router_with_authorization(
+        Lqs::new(),
+        "http://localhost",
+        bearer_hook(credential, "111111111111"),
+    );
+    let queue = "http://localhost/000000000000/q";
+    for (action, body) in [
+        ("CreateQueue", json!({"QueueName":"rogue"})),
+        ("ListQueues", json!({})),
+        (
+            "SendMessage",
+            json!({"QueueUrl":queue,"MessageBody":"rogue"}),
+        ),
+        ("ReceiveMessage", json!({"QueueUrl":queue})),
+        ("DeleteQueue", json!({"QueueUrl":queue})),
+    ] {
+        for authorization in [
+            vec![],
+            vec!["AWS4-HMAC-SHA256 Credential=bogus"],
+            vec!["Bearer wrong"],
+        ] {
+            assert_eq!(
+                bearer_call(app.clone(), action, body.clone(), &authorization, None)
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "{action}"
+            );
+        }
+    }
+    assert_eq!(
+        bearer_call(
+            app.clone(),
+            "CreateQueue",
+            json!({"QueueName":"q"}),
+            &[&good],
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        bearer_call(app.clone(), "ListQueues", json!({}), &[&good], None)
+            .await
+            .1["QueueUrls"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for (headers, principal) in [
+        (vec![good.as_str()], Some("111111111111")),
+        (vec![good.as_str(), good.as_str()], None),
+    ] {
+        assert_eq!(
+            bearer_call(
+                app.clone(),
+                "SendMessage",
+                json!({"QueueUrl":queue,"MessageBody":"rogue"}),
+                &headers,
+                principal
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        bearer_call(
+            app,
+            "ReceiveMessage",
+            json!({"QueueUrl":queue}),
+            &[&good],
+            None
+        )
+        .await
+        .1["Messages"]
+            .as_array()
+            .map_or(0, Vec::len),
+        0
+    );
+}
+
+#[tokio::test]
+async fn authenticated_identity_still_obeys_explicit_policy_deny() {
+    let credential = "1234567890abcdefghijklmnopqrstuv";
+    let mut lqs = Lqs::new();
+    lqs.create_queue(
+        "q",
+        QueueType::Standard,
+        QueueOptions {
+            security: QueueSecurity {
+                policy: Some(json!({"Version":"2012-10-17","Statement":[
+                    {"Effect":"Allow","Principal":{"AWS":"111111111111"},"Action":"sqs:*","Resource":"*"},
+                    {"Effect":"Deny","Principal":{"AWS":"111111111111"},"Action":"sqs:SendMessage","Resource":"*"}
+                ]}).to_string()),
+                ..QueueSecurity::default()
+            },
+            ..QueueOptions::default()
+        },
+    ).unwrap();
+    let app = router_with_authorization(
+        lqs,
+        "http://localhost",
+        bearer_hook(credential, "111111111111"),
+    );
+    assert_eq!(
+        bearer_call(
+            app,
+            "SendMessage",
+            json!({"QueueUrl":"http://localhost/000000000000/q","MessageBody":"denied"}),
+            &[&format!("Bearer {credential}")],
+            None
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[test]
+fn local_principal_header_rejects_duplicates_and_malformed_values() {
+    let hook = local_hook(true);
+    for values in [vec!["111111111111", "111111111111"], vec!["invalid"]] {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append("x-lqs-principal", HeaderValue::from_static(value));
+        }
+        let request = HttpAuthorizationRequest {
+            action: "ListQueues".into(),
+            queue_name: None,
+            headers,
+            method: Method::POST,
+            uri: "/".parse().unwrap(),
+            body: Bytes::new(),
+        };
+        assert!(matches!(hook(&request), Err(LqsError::AccessDenied)));
+    }
+}
+
 #[tokio::test]
 async fn authorization_covers_single_batch_and_management_without_side_effects() {
     let app = app(false);
