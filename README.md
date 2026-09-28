@@ -65,6 +65,9 @@ SDK の SQS クライアントに以下を設定してください。JSON / SQS 
 | `LQS_AUTH_TOKEN` | 未設定 | HTTP Bearer 認証用のトークン（32文字以上の空白を含まない印字可能 ASCII） |
 | `LQS_AUTH_PRINCIPAL` | 未設定 | Bearer 認証済みリクエストに割り当てるアカウント ID または IAM ARN |
 | `LQS_ALLOW_UNAUTHENTICATED_REMOTE` | `false` | 認証なしで loopback 以外に bind する危険な設定を明示的に許可 |
+| `LQS_MAX_IN_FLIGHT` | `128` | 同時に処理する HTTP リクエスト数の上限（ロングポーリングを含む） |
+| `LQS_REQUESTS_PER_SECOND` | `1000` | HTTP リクエストの受付レート（同数のバーストを許容） |
+| `LQS_BODY_READ_TIMEOUT_MS` | `5000` | 本文の読み取りに許す時間（ミリ秒） |
 
 既定の認証なしモードは loopback でのみ起動します。外部向けに待ち受ける場合は `LQS_AUTH_TOKEN` と `LQS_AUTH_PRINCIPAL` を両方指定するか、危険性を理解したうえで `LQS_ALLOW_UNAUTHENTICATED_REMOTE=true` を指定します。Bearer モードではすべての SQS 操作に `Authorization: Bearer <token>` が必要です。トークンは安全な乱数で生成し、TLS 終端などで通信とトークンを保護してください。`x-lqs-principal` はクライアントの自己申告であり、認証ではありません。`LQS_TRUST_PRINCIPAL_HEADER=true` は loopback での権限テストに限定し、Bearer モードと併用できません。詳細は [呼び出し元の識別・ポリシー](docs/compatibility.md#security) を参照してください。
 

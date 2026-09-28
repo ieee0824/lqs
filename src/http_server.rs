@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     BatchResult, Lqs, LqsError, QueueOptions, QueueType, QueueUpdate, ReceivedMessage,
@@ -39,10 +40,47 @@ pub use security_http::{AuthorizationHook, HttpAuthorizationRequest};
 #[path = "polling_http_tests.rs"]
 mod polling_http_tests;
 
+#[cfg(test)]
+#[path = "limits_http_tests.rs"]
+mod limits_http_tests;
+
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:9324";
 const DEFAULT_DATABASE_PATH: &str = "lqs.sqlite";
 // A 1 MiB decoded body can expand up to 6x in JSON, or 3x in Query encoding.
 const MAX_REQUEST_BYTES: usize = 8 * 1_048_576;
+const DEFAULT_MAX_IN_FLIGHT: usize = 128;
+const DEFAULT_REQUESTS_PER_SECOND: u32 = 1_000;
+const DEFAULT_BODY_READ_TIMEOUT_MS: u64 = 5_000;
+
+#[derive(Clone, Copy, Debug)]
+pub struct HttpLimits {
+    pub max_in_flight: usize,
+    pub requests_per_second: u32,
+    pub body_read_timeout: Duration,
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        Self {
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            requests_per_second: DEFAULT_REQUESTS_PER_SECOND,
+            body_read_timeout: Duration::from_millis(DEFAULT_BODY_READ_TIMEOUT_MS),
+        }
+    }
+}
+
+impl HttpLimits {
+    fn validate(self) -> Result<(), ServerConfigError> {
+        if self.max_in_flight == 0
+            || self.max_in_flight > Semaphore::MAX_PERMITS
+            || self.requests_per_second == 0
+            || self.body_read_timeout.is_zero()
+        {
+            return Err(ServerConfigError::InvalidHttpLimits);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -50,6 +88,7 @@ pub struct ServerConfig {
     pub allow_unauthenticated_remote: bool,
     pub bearer_credential: Option<String>,
     pub auth_principal: Option<String>,
+    pub http_limits: HttpLimits,
     pub bind_addr: SocketAddr,
     pub database_path: PathBuf,
     pub public_base_url: String,
@@ -69,6 +108,7 @@ impl fmt::Debug for ServerConfig {
                 &self.bearer_credential.as_ref().map(|_| "[redacted]"),
             )
             .field("auth_principal", &self.auth_principal)
+            .field("http_limits", &self.http_limits)
             .field("bind_addr", &self.bind_addr)
             .field("database_path", &self.database_path)
             .field("public_base_url", &self.public_base_url)
@@ -119,6 +159,17 @@ impl ServerConfig {
                     return Err(ServerConfigError::InvalidAuthPrincipal);
                 }
             },
+            http_limits: HttpLimits {
+                max_in_flight: env_limit("LQS_MAX_IN_FLIGHT", DEFAULT_MAX_IN_FLIGHT)?,
+                requests_per_second: env_limit(
+                    "LQS_REQUESTS_PER_SECOND",
+                    DEFAULT_REQUESTS_PER_SECOND,
+                )?,
+                body_read_timeout: Duration::from_millis(env_limit(
+                    "LQS_BODY_READ_TIMEOUT_MS",
+                    DEFAULT_BODY_READ_TIMEOUT_MS,
+                )?),
+            },
             bind_addr,
             database_path,
             public_base_url,
@@ -128,6 +179,7 @@ impl ServerConfig {
     }
 
     pub fn validate(&self) -> Result<(), ServerConfigError> {
+        self.http_limits.validate()?;
         if self.trust_principal_header && !self.bind_addr.ip().is_loopback() {
             return Err(ServerConfigError::RemotePrincipalHeader);
         }
@@ -154,6 +206,23 @@ impl ServerConfig {
     }
 }
 
+fn env_limit<T>(name: &str, default: T) -> Result<T, ServerConfigError>
+where
+    T: FromStr + Copy + PartialOrd + Default,
+{
+    let value = match env::var(name) {
+        Ok(value) => value
+            .parse::<T>()
+            .map_err(|_| ServerConfigError::InvalidHttpLimits)?,
+        Err(env::VarError::NotPresent) => default,
+        Err(env::VarError::NotUnicode(_)) => return Err(ServerConfigError::InvalidHttpLimits),
+    };
+    if value <= T::default() {
+        return Err(ServerConfigError::InvalidHttpLimits);
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod server_config_tests {
     use super::*;
@@ -164,6 +233,7 @@ mod server_config_tests {
             allow_unauthenticated_remote: false,
             bearer_credential: None,
             auth_principal: None,
+            http_limits: HttpLimits::default(),
             bind_addr: address.parse().unwrap(),
             database_path: PathBuf::from("lqs.sqlite"),
             public_base_url: "http://localhost".into(),
@@ -217,6 +287,7 @@ mod server_config_tests {
 
 #[derive(Debug)]
 pub enum ServerConfigError {
+    InvalidHttpLimits,
     InvalidAuthorizationMode,
     InvalidRemoteMode,
     RemotePrincipalHeader,
@@ -232,6 +303,7 @@ pub enum ServerConfigError {
 impl fmt::Display for ServerConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidHttpLimits => write!(formatter, "HTTP limits must be positive integers"),
             Self::InvalidAuthorizationMode => write!(
                 formatter,
                 "LQS_TRUST_PRINCIPAL_HEADER must be true or false"
@@ -307,11 +379,76 @@ impl From<std::io::Error> for ServerError {
 
 #[derive(Clone)]
 struct AppState {
+    admission: Arc<Admission>,
     authorization_hook: Arc<AuthorizationHook>,
     access: Option<security_http::AccessContext>,
     lqs: Arc<Mutex<Lqs>>,
     public_base_url: Arc<str>,
     request_sequence: Arc<AtomicU64>,
+}
+
+struct Admission {
+    slots: Arc<Semaphore>,
+    rate: Mutex<RateState>,
+    limits: HttpLimits,
+}
+
+struct RateState {
+    tokens: f64,
+    updated_at: Instant,
+}
+
+enum AdmissionError {
+    Busy,
+    RateLimited,
+}
+
+impl Admission {
+    fn new(limits: HttpLimits) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(limits.max_in_flight)),
+            rate: Mutex::new(RateState {
+                tokens: f64::from(limits.requests_per_second),
+                updated_at: Instant::now(),
+            }),
+            limits,
+        }
+    }
+
+    fn try_enter(&self) -> Result<OwnedSemaphorePermit, AdmissionError> {
+        let permit = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AdmissionError::Busy)?;
+        let mut rate = self.rate.lock().map_err(|_| AdmissionError::Busy)?;
+        let now = Instant::now();
+        rate.tokens = (rate.tokens
+            + now.duration_since(rate.updated_at).as_secs_f64()
+                * f64::from(self.limits.requests_per_second))
+        .min(f64::from(self.limits.requests_per_second));
+        rate.updated_at = now;
+        if rate.tokens < 1.0 {
+            return Err(AdmissionError::RateLimited);
+        }
+        rate.tokens -= 1.0;
+        Ok(permit)
+    }
+}
+
+fn admission_error(error: AdmissionError) -> ApiError {
+    match error {
+        AdmissionError::Busy => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "too many concurrent requests",
+        ),
+        AdmissionError::RateLimited => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RequestThrottled",
+            "request rate limit exceeded",
+        ),
+    }
 }
 
 impl AppState {
@@ -331,7 +468,12 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     axum::serve(
         listener,
-        router_with_authorization(lqs, config.public_base_url, authorization_hook),
+        router_with_authorization_and_limits(
+            lqs,
+            config.public_base_url,
+            authorization_hook,
+            config.http_limits,
+        ),
     )
     .await
     .map_err(ServerError::Io)
@@ -361,7 +503,23 @@ pub fn router_with_authorization(
     public_base_url: impl Into<String>,
     authorization_hook: Arc<AuthorizationHook>,
 ) -> Router {
+    router_with_authorization_and_limits(
+        lqs,
+        public_base_url,
+        authorization_hook,
+        HttpLimits::default(),
+    )
+}
+
+pub fn router_with_authorization_and_limits(
+    lqs: Lqs,
+    public_base_url: impl Into<String>,
+    authorization_hook: Arc<AuthorizationHook>,
+    limits: HttpLimits,
+) -> Router {
+    limits.validate().expect("valid HTTP limits");
     let state = AppState {
+        admission: Arc::new(Admission::new(limits)),
         authorization_hook,
         access: None,
         lqs: Arc::new(Mutex::new(lqs)),
@@ -369,13 +527,28 @@ pub fn router_with_authorization(
         request_sequence: Arc::new(AtomicU64::new(1)),
     };
     Router::new()
-        .route("/health", get(|| async { StatusCode::OK }))
+        .route("/health", get(handle_health))
         .fallback(handle_request)
         .with_state(state)
 }
 
+async fn handle_health(State(state): State<AppState>) -> StatusCode {
+    match state.admission.try_enter() {
+        Ok(_permit) => StatusCode::OK,
+        Err(AdmissionError::Busy) => StatusCode::SERVICE_UNAVAILABLE,
+        Err(AdmissionError::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
+    }
+}
+
 async fn handle_request(State(mut state): State<AppState>, request: Request) -> Response {
     let request_id = state.next_request_id();
+    let _permit = match state.admission.try_enter() {
+        Ok(permit) => permit,
+        Err(error) => {
+            return admission_error(error)
+                .into_response(protocol_from_headers(request.headers()), &request_id);
+        }
+    };
     if request.method() != Method::POST {
         return ApiError::new(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -399,15 +572,30 @@ async fn process_post(
     let uri = request.uri().clone();
     let headers = request.headers().clone();
     let fallback_protocol = protocol_from_headers(&headers);
-    let body = match to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
-        Ok(body) => body,
-        Err(_) => {
+    let body = match tokio::time::timeout(
+        state.admission.limits.body_read_timeout,
+        to_bytes(request.into_body(), MAX_REQUEST_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
             return (
                 fallback_protocol,
                 Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "InvalidParameterValue",
                     "request body is too large",
+                )),
+            );
+        }
+        Err(_) => {
+            return (
+                fallback_protocol,
+                Err(ApiError::new(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "RequestTimeout",
+                    "request body read deadline exceeded",
                 )),
             );
         }
