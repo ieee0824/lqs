@@ -32,10 +32,10 @@ curl --fail http://127.0.0.1:9324/ \
 
 ```bash
 docker build -t lqs .
-docker run --rm --name lqs -p 127.0.0.1:9324:9324 -v lqs-data:/data lqs
+docker run --rm --name lqs -p 127.0.0.1:9324:9324 -e LQS_ALLOW_UNAUTHENTICATED_REMOTE=true -v lqs-data:/data lqs
 ```
 
-別ターミナルから `curl --fail http://127.0.0.1:9324/health` で確認できます。SQLite のデータは Docker ボリューム `lqs-data` に保存されます。コンテナ内では `0.0.0.0:9324` で待ち受けますが、上記の公開ポートはホストのローカル接続に限定されます。
+別ターミナルから `curl --fail http://127.0.0.1:9324/health` で確認できます。SQLite のデータは Docker ボリューム `lqs-data` に保存されます。コンテナ内では `0.0.0.0:9324` で待ち受けるため、ローカル用の例でも危険な開放設定を明示しています。上記の公開ポートはホストのローカル接続に限定されます。コンテナや Docker ネットワークからの接続には認証がありません。
 
 Docker イメージの `LQS_BASE_URL` はホストから使う `http://127.0.0.1:9324` に設定しています。別のコンテナから Queue URL を使う場合は、`docker run -e LQS_BASE_URL=http://<接続可能なホスト名>:9324 ...` でクライアントから到達できる URL に変更してください。
 
@@ -62,8 +62,11 @@ SDK の SQS クライアントに以下を設定してください。JSON / SQS 
 | `LQS_BASE_URL` | `http://` + 待ち受けアドレス | Queue URL に使用する公開 URL |
 | `LQS_DATABASE_PATH` | `lqs.sqlite` | SQLite ファイル |
 | `LQS_TRUST_PRINCIPAL_HEADER` | `false` | `true` の場合、権限テスト用の `x-lqs-principal` を受け付ける |
+| `LQS_AUTH_TOKEN` | 未設定 | HTTP Bearer 認証用のトークン（32文字以上の空白を含まない印字可能 ASCII） |
+| `LQS_AUTH_PRINCIPAL` | 未設定 | Bearer 認証済みリクエストに割り当てるアカウント ID または IAM ARN |
+| `LQS_ALLOW_UNAUTHENTICATED_REMOTE` | `false` | 認証なしで loopback 以外に bind する危険な設定を明示的に許可 |
 
-`x-lqs-principal` はクライアントの自己申告であり、認証ではありません。有効化はローカルの権限テストに限定してください。詳細は [呼び出し元の識別・ポリシー](docs/compatibility.md#security) を参照してください。
+既定の認証なしモードは loopback でのみ起動します。外部向けに待ち受ける場合は `LQS_AUTH_TOKEN` と `LQS_AUTH_PRINCIPAL` を両方指定するか、危険性を理解したうえで `LQS_ALLOW_UNAUTHENTICATED_REMOTE=true` を指定します。Bearer モードではすべての SQS 操作に `Authorization: Bearer <token>` が必要です。トークンは安全な乱数で生成し、TLS 終端などで通信とトークンを保護してください。`x-lqs-principal` はクライアントの自己申告であり、認証ではありません。`LQS_TRUST_PRINCIPAL_HEADER=true` は loopback での権限テストに限定し、Bearer モードと併用できません。詳細は [呼び出し元の識別・ポリシー](docs/compatibility.md#security) を参照してください。
 
 <a id="features"></a>
 

@@ -44,12 +44,36 @@ const DEFAULT_DATABASE_PATH: &str = "lqs.sqlite";
 // A 1 MiB decoded body can expand up to 6x in JSON, or 3x in Query encoding.
 const MAX_REQUEST_BYTES: usize = 8 * 1_048_576;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     pub trust_principal_header: bool,
+    pub allow_unauthenticated_remote: bool,
+    pub bearer_credential: Option<String>,
+    pub auth_principal: Option<String>,
     pub bind_addr: SocketAddr,
     pub database_path: PathBuf,
     pub public_base_url: String,
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerConfig")
+            .field("trust_principal_header", &self.trust_principal_header)
+            .field(
+                "allow_unauthenticated_remote",
+                &self.allow_unauthenticated_remote,
+            )
+            .field(
+                "bearer_credential",
+                &self.bearer_credential.as_ref().map(|_| "[redacted]"),
+            )
+            .field("auth_principal", &self.auth_principal)
+            .field("bind_addr", &self.bind_addr)
+            .field("database_path", &self.database_path)
+            .field("public_base_url", &self.public_base_url)
+            .finish()
+    }
 }
 
 impl ServerConfig {
@@ -68,22 +92,139 @@ impl ServerConfig {
         if !(public_base_url.starts_with("http://") || public_base_url.starts_with("https://")) {
             return Err(ServerConfigError::InvalidBaseUrl(public_base_url));
         }
-        Ok(Self {
+        let config = Self {
             trust_principal_header: match env::var("LQS_TRUST_PRINCIPAL_HEADER").as_deref() {
                 Ok("true") => true,
                 Ok("false") | Err(env::VarError::NotPresent) => false,
                 _ => return Err(ServerConfigError::InvalidAuthorizationMode),
             },
+            allow_unauthenticated_remote: match env::var("LQS_ALLOW_UNAUTHENTICATED_REMOTE")
+                .as_deref()
+            {
+                Ok("true") => true,
+                Ok("false") | Err(env::VarError::NotPresent) => false,
+                _ => return Err(ServerConfigError::InvalidRemoteMode),
+            },
+            bearer_credential: match env::var("LQS_AUTH_TOKEN") {
+                Ok(value) => Some(value),
+                Err(env::VarError::NotPresent) => None,
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err(ServerConfigError::InvalidCredential);
+                }
+            },
+            auth_principal: match env::var("LQS_AUTH_PRINCIPAL") {
+                Ok(value) => Some(value),
+                Err(env::VarError::NotPresent) => None,
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err(ServerConfigError::InvalidAuthPrincipal);
+                }
+            },
             bind_addr,
             database_path,
             public_base_url,
-        })
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ServerConfigError> {
+        if self.trust_principal_header && !self.bind_addr.ip().is_loopback() {
+            return Err(ServerConfigError::RemotePrincipalHeader);
+        }
+        if self.trust_principal_header && self.bearer_credential.is_some() {
+            return Err(ServerConfigError::ConflictingAuthenticationModes);
+        }
+        match (&self.bearer_credential, &self.auth_principal) {
+            (Some(credential), Some(principal)) => {
+                if credential.len() < 32 || !credential.bytes().all(|byte| byte.is_ascii_graphic())
+                {
+                    return Err(ServerConfigError::InvalidCredential);
+                }
+                crate::RequestIdentity::aws(principal)
+                    .map_err(|_| ServerConfigError::InvalidAuthPrincipal)?;
+            }
+            (None, None) => {
+                if !self.bind_addr.ip().is_loopback() && !self.allow_unauthenticated_remote {
+                    return Err(ServerConfigError::UnauthenticatedRemote);
+                }
+            }
+            _ => return Err(ServerConfigError::IncompleteAuthentication),
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod server_config_tests {
+    use super::*;
+
+    fn config(address: &str) -> ServerConfig {
+        ServerConfig {
+            trust_principal_header: false,
+            allow_unauthenticated_remote: false,
+            bearer_credential: None,
+            auth_principal: None,
+            bind_addr: address.parse().unwrap(),
+            database_path: PathBuf::from("lqs.sqlite"),
+            public_base_url: "http://localhost".into(),
+        }
+    }
+
+    #[test]
+    fn remote_bind_requires_authentication_or_explicit_unsafe_mode() {
+        assert!(config("127.0.0.1:9324").validate().is_ok());
+        assert!(config("[::1]:9324").validate().is_ok());
+        let mut remote = config("0.0.0.0:9324");
+        assert!(matches!(
+            remote.validate(),
+            Err(ServerConfigError::UnauthenticatedRemote)
+        ));
+        remote.allow_unauthenticated_remote = true;
+        assert!(remote.validate().is_ok());
+        remote.trust_principal_header = true;
+        assert!(matches!(
+            remote.validate(),
+            Err(ServerConfigError::RemotePrincipalHeader)
+        ));
+    }
+
+    #[test]
+    fn bearer_configuration_requires_complete_credentials_and_excludes_header_mode() {
+        let mut config = config("0.0.0.0:9324");
+        config.bearer_credential = Some("1234567890abcdefghijklmnopqrstuv".into());
+        assert!(matches!(
+            config.validate(),
+            Err(ServerConfigError::IncompleteAuthentication)
+        ));
+        config.auth_principal = Some("111111111111".into());
+        assert!(config.validate().is_ok());
+        config.trust_principal_header = true;
+        assert!(config.validate().is_err());
+        config.trust_principal_header = false;
+        config.bearer_credential = Some("short".into());
+        assert!(matches!(
+            config.validate(),
+            Err(ServerConfigError::InvalidCredential)
+        ));
+        config.bearer_credential = Some("1234567890abcdefghijklmnopqrstuv".into());
+        config.auth_principal = Some("unvalidated".into());
+        assert!(matches!(
+            config.validate(),
+            Err(ServerConfigError::InvalidAuthPrincipal)
+        ));
     }
 }
 
 #[derive(Debug)]
 pub enum ServerConfigError {
     InvalidAuthorizationMode,
+    InvalidRemoteMode,
+    RemotePrincipalHeader,
+    ConflictingAuthenticationModes,
+    InvalidCredential,
+    InvalidAuthPrincipal,
+    IncompleteAuthentication,
+    UnauthenticatedRemote,
     InvalidBindAddress(String),
     InvalidBaseUrl(String),
 }
@@ -94,6 +235,34 @@ impl fmt::Display for ServerConfigError {
             Self::InvalidAuthorizationMode => write!(
                 formatter,
                 "LQS_TRUST_PRINCIPAL_HEADER must be true or false"
+            ),
+            Self::InvalidRemoteMode => write!(
+                formatter,
+                "LQS_ALLOW_UNAUTHENTICATED_REMOTE must be true or false"
+            ),
+            Self::RemotePrincipalHeader => write!(
+                formatter,
+                "LQS_TRUST_PRINCIPAL_HEADER requires a loopback LQS_BIND_ADDR"
+            ),
+            Self::ConflictingAuthenticationModes => write!(
+                formatter,
+                "LQS_TRUST_PRINCIPAL_HEADER cannot be combined with LQS_AUTH_TOKEN"
+            ),
+            Self::InvalidCredential => write!(
+                formatter,
+                "LQS_AUTH_TOKEN must have at least 32 printable ASCII characters without spaces"
+            ),
+            Self::InvalidAuthPrincipal => write!(
+                formatter,
+                "LQS_AUTH_PRINCIPAL must be an AWS account ID or IAM ARN"
+            ),
+            Self::IncompleteAuthentication => write!(
+                formatter,
+                "LQS_AUTH_TOKEN and LQS_AUTH_PRINCIPAL must be set together"
+            ),
+            Self::UnauthenticatedRemote => write!(
+                formatter,
+                "non-loopback LQS_BIND_ADDR requires LQS_AUTH_TOKEN and LQS_AUTH_PRINCIPAL or LQS_ALLOW_UNAUTHENTICATED_REMOTE=true"
             ),
             Self::InvalidBindAddress(message) => {
                 write!(formatter, "invalid LQS_BIND_ADDR: {message}")
@@ -107,6 +276,7 @@ impl std::error::Error for ServerConfigError {}
 
 #[derive(Debug)]
 pub enum ServerError {
+    Configuration(ServerConfigError),
     Database(LqsError),
     Io(std::io::Error),
 }
@@ -114,6 +284,7 @@ pub enum ServerError {
 impl fmt::Display for ServerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Configuration(error) => error.fmt(formatter),
             Self::Database(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
         }
@@ -151,15 +322,16 @@ impl AppState {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
+    config.validate().map_err(ServerError::Configuration)?;
+    let authorization_hook = match (&config.bearer_credential, &config.auth_principal) {
+        (Some(credential), Some(principal)) => security_http::bearer_hook(credential, principal),
+        _ => security_http::local_hook(config.trust_principal_header),
+    };
     let lqs = Lqs::open(&config.database_path)?;
     let listener = TcpListener::bind(config.bind_addr).await?;
     axum::serve(
         listener,
-        router_with_authorization(
-            lqs,
-            config.public_base_url,
-            security_http::local_hook(config.trust_principal_header),
-        ),
+        router_with_authorization(lqs, config.public_base_url, authorization_hook),
     )
     .await
     .map_err(ServerError::Io)
@@ -170,6 +342,11 @@ pub async fn serve_with_listener(
     lqs: Lqs,
     public_base_url: impl Into<String>,
 ) -> Result<(), ServerError> {
+    if !listener.local_addr()?.ip().is_loopback() {
+        return Err(ServerError::Configuration(
+            ServerConfigError::UnauthenticatedRemote,
+        ));
+    }
     axum::serve(listener, router(lqs, public_base_url))
         .await
         .map_err(ServerError::Io)

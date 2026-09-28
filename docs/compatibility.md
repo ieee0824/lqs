@@ -180,13 +180,19 @@ Rustでは`list_queues`、`queue_exists`、`queue_metrics`、`tag_queue`、`unta
 
 ### 呼び出し元の識別・認可フック
 
-既定では全HTTPリクエストをAnonymousとして評価し、`x-lqs-principal`を受け付けません。AWS SDKのSigV4ヘッダーは署名検証せず、そこからアカウントや権限を推定することもありません。
+既定ではloopbackでのみ起動し、全HTTPリクエストをAnonymousとして評価して`x-lqs-principal`を受け付けません。AWS SDKのSigV4ヘッダーは署名検証せず、そこからアカウントや権限を推定することもありません。
 
-ローカルの権限テストに限り、`LQS_TRUST_PRINCIPAL_HEADER=true`で起動すると`x-lqs-principal`にアカウントIDまたはIAM ARNを指定できます。**これはクライアントの自己申告で、誰でもなりすませます。認証ではありません。** ヘッダー省略時はAnonymousです。
+ローカルの権限テストに限り、`LQS_TRUST_PRINCIPAL_HEADER=true`で起動すると`x-lqs-principal`にアカウントIDまたはIAM ARNを指定できます。**これはクライアントの自己申告で、誰でもなりすませます。認証ではありません。** ヘッダー省略時はAnonymousです。重複したヘッダーや不正な値は拒否します。このモードはloopback以外のbindを拒否し、Bearerモードとは併用できません。
+
+外部向けbindでは、`LQS_AUTH_TOKEN`（32文字以上の空白を含まない印字可能ASCII）と`LQS_AUTH_PRINCIPAL`（アカウントIDまたはIAM ARN）を両方設定します。このモードでは全SQS操作に`Authorization: Bearer <token>`を要求し、認証した固定Principalをキューポリシーへ渡します。`CreateQueue`/`ListQueues`も認証必須です。`x-lqs-principal`、重複したAuthorizationヘッダー、誤ったトークン、SigV4ヘッダーだけの要求は拒否します。キューポリシーのDenyは認証済み要求にも適用されます。トークンは安全な乱数から生成し、起動環境で秘匿してください。HTTPサーバー自身はTLSを提供しないため、外部公開時はTLS終端で通信を保護してください。
+
+認証なしでloopback以外へbindする必要がある場合だけ、`LQS_ALLOW_UNAUTHENTICATED_REMOTE=true`を明示します。この設定では全操作が匿名アクセス可能で、Policy未設定のキューや新規作成・一覧は誰でも操作できます。`LQS_TRUST_PRINCIPAL_HEADER=true`の外部向けbindはこの設定でも許可されません。
 
 埋め込み用途では`router_with_authorization(lqs, base_url, Arc<AuthorizationHook>)`を利用します。フックはメソッド・URI・ヘッダー・元のbody・action・queue名を受け取り、検証済みの`RequestIdentity`か`LqsError::AccessDenied`を返します。フックは同期・非ブロッキングで実装してください。戻されたidentityでもキューポリシーを回避できません。新規CreateQueueとListQueuesは対象キューポリシーがないため、このフックでグローバルな許可を制御します。既定では新規作成・一覧は開放されます。署名検証、TLS、認証情報の管理、監査イベント記録は利用側の責任です。設定は取得できますがCloudTrail相当の監査ログは実装していません。
 
 同じサーバー内のポリシー確認と各操作は同じDB Mutex内で行います。DBファイルへ直接書けるプロセスや別の組み込み`Lqs`接続は信頼された管理者として扱います。SQLiteファイルのアクセス権や、複数プロセス間の認可境界をこのフックで保護するものではありません。
+
+`serve_with_listener`は匿名モードのためloopbackのlistenerに限定します。独自のRouterを外部公開する呼び出し側は適切な認証を構成してください。
 
 ### SSE-SQS / KMS構成モデル
 
