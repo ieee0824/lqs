@@ -49,7 +49,7 @@ const DEFAULT_DATABASE_PATH: &str = "lqs.sqlite";
 // A 1 MiB decoded body can expand up to 6x in JSON, or 3x in Query encoding.
 const MAX_REQUEST_BYTES: usize = 8 * 1_048_576;
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
-const DEFAULT_REQUESTS_PER_SECOND: u32 = 100;
+const DEFAULT_REQUESTS_PER_SECOND: u32 = 1_000;
 const DEFAULT_BODY_READ_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug)]

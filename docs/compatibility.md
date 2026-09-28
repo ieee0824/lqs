@@ -196,7 +196,7 @@ Rustでは`list_queues`、`queue_exists`、`queue_metrics`、`tag_queue`、`unta
 
 ### HTTP受付制限
 
-`LQS_MAX_IN_FLIGHT`（既定128）は同時に処理するリクエスト数を制限し、ロングポーリングも応答または切断まで枠を保持します。超過時はHTTP 503 `ServiceUnavailable`です。`LQS_REQUESTS_PER_SECOND`（既定100）はトークンバケットで同数のバーストを許容し、超過時はHTTP 429 `RequestThrottled`です。両制限は本文の読み取り・認証より前に適用されるため、認証失敗も受付レートに数えます。`/health`も制限対象です。
+`LQS_MAX_IN_FLIGHT`（既定128）は同時に処理するリクエスト数を制限し、ロングポーリングも応答または切断まで枠を保持します。超過時はHTTP 503 `ServiceUnavailable`です。`LQS_REQUESTS_PER_SECOND`（既定1000）はトークンバケットで同数のバーストを許容し、超過時はHTTP 429 `RequestThrottled`です。両制限は本文の読み取り・認証より前に適用されるため、認証失敗も受付レートに数えます。`/health`も制限対象です。
 
 `LQS_BODY_READ_TIMEOUT_MS`（既定5000）は本文を読み終えるまでの期限です。低速送信が期限を超えるとHTTP 408 `RequestTimeout`になります。本文読取後の処理と最大20秒のReceiveMessageロングポーリングはこの期限に含みません。制限値はすべて正の整数で指定します。
 
