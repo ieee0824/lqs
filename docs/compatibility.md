@@ -194,6 +194,12 @@ Rustでは`list_queues`、`queue_exists`、`queue_metrics`、`tag_queue`、`unta
 
 `serve_with_listener`は匿名モードのためloopbackのlistenerに限定します。独自のRouterを外部公開する呼び出し側は適切な認証を構成してください。
 
+### HTTP受付制限
+
+`LQS_MAX_IN_FLIGHT`（既定128）は同時に処理するリクエスト数を制限し、ロングポーリングも応答または切断まで枠を保持します。超過時はHTTP 503 `ServiceUnavailable`です。`LQS_REQUESTS_PER_SECOND`（既定100）はトークンバケットで同数のバーストを許容し、超過時はHTTP 429 `RequestThrottled`です。両制限は本文の読み取り・認証より前に適用されるため、認証失敗も受付レートに数えます。`/health`も制限対象です。
+
+`LQS_BODY_READ_TIMEOUT_MS`（既定5000）は本文を読み終えるまでの期限です。低速送信が期限を超えるとHTTP 408 `RequestTimeout`になります。本文読取後の処理と最大20秒のReceiveMessageロングポーリングはこの期限に含みません。制限値はすべて正の整数で指定します。
+
 ### SSE-SQS / KMS構成モデル
 
 `SqsManagedSseEnabled`（既定false）、`KmsMasterKeyId`、`KmsDataKeyReusePeriodSeconds`（60〜86,400秒、既定300）をCreate/Set/Getで保持します。SSE-SQSとKMSを同時に有効化できません。KMSキー指定はSSE-SQSを無効化し、SSE-SQSの有効化はKMSキーを解除します。空のKmsMasterKeyIdはKMSを解除します。キーは識別子として保存するだけで、実在性・キーへの権限は確認しません。
