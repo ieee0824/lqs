@@ -301,129 +301,8 @@ impl Lqs {
     }
 
     fn from_connection(mut connection: Connection) -> Result<Self, LqsError> {
-        connection.execute_batch(
-            "
-            PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
-            CREATE TABLE IF NOT EXISTS queues (
-                name TEXT PRIMARY KEY NOT NULL,
-                queue_type TEXT NOT NULL CHECK(queue_type IN ('standard', 'fifo')),
-                visibility_timeout_ms INTEGER NOT NULL CHECK(visibility_timeout_ms BETWEEN 0 AND 43200000),
-                content_based_deduplication INTEGER NOT NULL CHECK(content_based_deduplication IN (0, 1)),
-                deduplication_window_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id TEXT UNIQUE,
-                queue_name TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
-                body TEXT NOT NULL,
-                group_id TEXT,
-                receipt_handle TEXT UNIQUE,
-                invisible_until_ms INTEGER,
-                receive_count INTEGER NOT NULL DEFAULT 0,
-                created_at_ms INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS messages_by_queue_sequence ON messages(queue_name, sequence);
-            CREATE INDEX IF NOT EXISTS messages_by_fifo_group ON messages(queue_name, group_id, sequence);
-            CREATE TABLE IF NOT EXISTS deduplication_keys (
-                queue_name TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
-                deduplication_id TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                seen_at_ms INTEGER NOT NULL,
-                PRIMARY KEY(queue_name, deduplication_id)
-            );
-            CREATE TABLE IF NOT EXISTS redrive_policies (
-                source_queue TEXT PRIMARY KEY NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
-                dead_letter_queue TEXT NOT NULL REFERENCES queues(name),
-                max_receive_count INTEGER NOT NULL CHECK(max_receive_count BETWEEN 1 AND 1000),
-                CHECK(source_queue != dead_letter_queue)
-            );
-            CREATE INDEX IF NOT EXISTS redrive_by_target ON redrive_policies(dead_letter_queue, source_queue);
-            CREATE TABLE IF NOT EXISTS dead_letter_origins (
-                sequence INTEGER PRIMARY KEY REFERENCES messages(sequence) ON DELETE CASCADE,
-                source_queue TEXT NOT NULL REFERENCES queues(name)
-            );
-            ",
-        )?;
-        // Additive, transactional migration also upgrades databases from before #4.
-        // The v9 queue CHECK migration rebuilds the parent table without cascading
-        // deletes. Foreign keys are validated before commit and re-enabled below.
-        connection.pragma_update(None, "foreign_keys", "OFF")?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (table, column, definition) in [
-            (
-                "queues",
-                "delay_ms",
-                "INTEGER NOT NULL DEFAULT 0 CHECK(delay_ms BETWEEN 0 AND 900000)",
-            ),
-            (
-                "queues",
-                "message_retention_ms",
-                "INTEGER NOT NULL DEFAULT 345600000 CHECK(message_retention_ms BETWEEN 60000 AND 1209600000)",
-            ),
-            (
-                "queues",
-                "maximum_message_size",
-                "INTEGER NOT NULL DEFAULT 1048576 CHECK(maximum_message_size BETWEEN 1024 AND 1048576)",
-            ),
-            ("messages", "available_at_ms", "INTEGER NOT NULL DEFAULT 0"),
-            (
-                "messages",
-                "message_attributes",
-                "TEXT NOT NULL DEFAULT '{}'",
-            ),
-            ("messages", "first_received_at_ms", "INTEGER"),
-            ("messages", "message_deduplication_id", "TEXT"),
-            (
-                "messages",
-                "total_receive_count",
-                "INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "queues",
-                "receive_wait_time_ms",
-                "INTEGER NOT NULL DEFAULT 0 CHECK(receive_wait_time_ms BETWEEN 0 AND 20000)",
-            ),
-            (
-                "queues",
-                "max_in_flight",
-                "INTEGER NOT NULL DEFAULT 120000 CHECK(max_in_flight BETWEEN 1 AND 120000)",
-            ),
-        ] {
-            let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
-            let columns = statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?;
-            if !columns.iter().any(|name| name == column) {
-                transaction.execute_batch(&format!(
-                    "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-                ))?;
-                if column == "message_deduplication_id" {
-                    transaction.execute("UPDATE messages SET message_deduplication_id = (SELECT deduplication_id FROM deduplication_keys WHERE deduplication_keys.queue_name = messages.queue_name AND deduplication_keys.message_id = messages.message_id LIMIT 1)", [])?;
-                }
-                if column == "total_receive_count" {
-                    transaction.execute(
-                        "UPDATE messages SET total_receive_count = receive_count",
-                        [],
-                    )?;
-                }
-            }
-        }
-        transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_created ON messages(queue_name, created_at_ms)")?;
-        transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_inflight ON messages(queue_name, invisible_until_ms)")?;
-        fifo::migrate(&transaction)?;
-        management::migrate(&transaction)?;
-        security_sqlite::migrate(&transaction)?;
-        if transaction
-            .prepare("PRAGMA foreign_key_check")?
-            .exists([])?
-        {
-            return Err(LqsError::Database(
-                "foreign key check failed during migration".into(),
-            ));
-        }
-        transaction.commit()?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
+        create_base_schema(&connection)?;
+        migrate_existing_schema(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -451,34 +330,7 @@ impl Lqs {
         now_ms: u64,
     ) -> Result<(), LqsError> {
         let name = name.into();
-        options.security.validate()?;
-        management::validate_tags(&tags)?;
-        if queue_type == QueueType::Fifo && !name.ends_with(".fifo") {
-            return Err(LqsError::InvalidFifoName(name));
-        }
-        if queue_type == QueueType::Standard && name.ends_with(".fifo") {
-            return Err(LqsError::InvalidStandardName(name));
-        }
-        if options.visibility_timeout_ms > 43_200_000 {
-            return Err(LqsError::InvalidVisibilityTimeout);
-        }
-        validate_delivery_options(
-            options.delay_ms,
-            options.message_retention_ms,
-            options.maximum_message_size,
-        )?;
-        validate_receive_options(options.receive_wait_time_ms, options.max_in_flight)?;
-        validate_fifo(
-            queue_type,
-            options.content_based_deduplication,
-            options.deduplication_scope,
-            options.fifo_throughput_limit,
-        )?;
-        if options.deduplication_window_ms != 300_000 {
-            return Err(LqsError::InvalidDeliveryOptions(
-                "deduplication window is fixed at 300000ms".into(),
-            ));
-        }
+        validate_queue_creation(&name, queue_type, &options, &tags)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -493,29 +345,9 @@ impl Lqs {
             return Err(LqsError::QueueDeletedRecently);
         }
         transaction.execute("DELETE FROM deleted_queues WHERE name = ?1", [&name])?;
-        let result = transaction.execute(
-            "INSERT INTO queues(name, queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms, delay_ms, message_retention_ms, maximum_message_size, receive_wait_time_ms, max_in_flight)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![name, queue_type.as_db_value(), ms(options.visibility_timeout_ms), i64::from(options.content_based_deduplication), ms(options.deduplication_window_ms), ms(options.delay_ms), ms(options.message_retention_ms), options.maximum_message_size, ms(options.receive_wait_time_ms), options.max_in_flight],
-        );
-        match result {
-            Ok(_) => {
-                security_sqlite::write(&transaction, &name, &options.security)?;
-                transaction.execute(
-                    "UPDATE queues SET created_at_ms = ?2, modified_at_ms = ?2 WHERE name = ?1",
-                    params![name, ms(now_ms)],
-                )?;
-                management::write_tags(&transaction, &name, &tags)?;
-                transaction.execute("UPDATE queues SET deduplication_scope = ?2, fifo_throughput_limit = ?3 WHERE name = ?1", params![name, options.deduplication_scope.as_str(), options.fifo_throughput_limit.as_str()])?;
-                write_redrive_policy(&transaction, &name, options.redrive_policy.as_ref())?;
-                transaction.commit()?;
-                Ok(())
-            }
-            Err(rusqlite::Error::SqliteFailure(error, _)) if error.extended_code == 1555 => {
-                Err(LqsError::QueueAlreadyExists(name))
-            }
-            Err(error) => Err(error.into()),
-        }
+        insert_queue(&transaction, &name, queue_type, &options, &tags, now_ms)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn send(
@@ -528,114 +360,24 @@ impl Lqs {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let config = read_queue_config(&transaction, queue_name)?;
-        let SendRequest {
-            body,
-            message_group_id,
-            deduplication_id,
-            delay_ms,
-            mut message_attributes,
-        } = request;
-        let size = body
-            .len()
-            .saturating_add(message_attributes_size(&message_attributes));
-        if body.is_empty() || size > config.maximum_message_size {
-            return Err(LqsError::InvalidMessageSize {
-                size,
-                maximum: config.maximum_message_size,
-            });
-        }
-        validate_message_attributes(&mut message_attributes)?;
-        // Normalizing a Number can expand exponent notation; validate the stored size too.
-        let normalized_size = body
-            .len()
-            .saturating_add(message_attributes_size(&message_attributes));
-        if normalized_size > config.maximum_message_size {
-            return Err(LqsError::InvalidMessageSize {
-                size: normalized_size,
-                maximum: config.maximum_message_size,
-            });
-        }
-        let attribute_md5 = message_attributes_md5(&message_attributes);
-        let attributes_json = serde_json::to_string(&message_attributes)
-            .map_err(|error| LqsError::Database(error.to_string()))?;
-        if let Some(delay) = delay_ms
-            && (config.queue_type == QueueType::Fifo || delay > 900_000)
-        {
-            return Err(LqsError::InvalidDeliveryOptions(
-                "message delay must be 0-900000ms and is only allowed for Standard queues".into(),
-            ));
-        }
-        let group_id = match config.queue_type {
-            QueueType::Standard => message_group_id,
-            QueueType::Fifo => {
-                let group = message_group_id.ok_or(LqsError::FifoRequiresGroupId)?;
-                if group.is_empty() {
-                    return Err(LqsError::EmptyGroupId);
-                }
-                Some(group)
-            }
-        };
-        for (name, value) in [
-            ("MessageGroupId", group_id.as_deref()),
-            ("MessageDeduplicationId", deduplication_id.as_deref()),
-        ] {
-            if let Some(value) = value
-                && (!(1..=128).contains(&value.len())
-                    || !value.bytes().all(|b| b.is_ascii_graphic()))
-            {
-                return Err(LqsError::InvalidMessageIdentifier(name));
-            }
-        }
+        let prepared = prepare_send(request, &config)?;
         expire_messages(&transaction, queue_name, ms(now_ms))?;
-        if config.queue_type == QueueType::Standard && deduplication_id.is_some() {
-            return Err(LqsError::InvalidDeliveryOptions(
-                "MessageDeduplicationId is only allowed for FIFO queues".into(),
-            ));
+        if let Some(message_id) =
+            find_duplicate(&transaction, queue_name, &config, &prepared, now_ms)?
+        {
+            transaction.commit()?;
+            return Ok(SendResult {
+                message_id,
+                deduplicated: true,
+                md5_of_message_attributes: prepared.attribute_md5,
+            });
         }
-        let deduplication_id = if config.queue_type == QueueType::Fifo {
-            let key = match deduplication_id {
-                Some(value) => value,
-                None if config.content_based_deduplication => stable_content_id(&body),
-                None => return Err(LqsError::DeduplicationIdRequired),
-            };
-            if now_ms >= config.deduplication_window_ms {
-                transaction.execute(
-                    "DELETE FROM deduplication_keys WHERE queue_name = ?1 AND seen_at_ms <= ?2",
-                    params![queue_name, ms(now_ms - config.deduplication_window_ms)],
-                )?;
-            }
-            if let Some(message_id) = transaction.query_row(
-                "SELECT message_id FROM deduplication_keys WHERE queue_name = ?1 AND deduplication_id = ?2 AND (?3 = 'queue' OR group_id = ?4 OR group_id = '') ORDER BY seen_at_ms, message_id LIMIT 1",
-                params![queue_name, key, config.deduplication_scope.as_str(), group_id], |row| row.get(0),
-            ).optional()? {
-                transaction.commit()?;
-                return Ok(SendResult { message_id, deduplicated: true, md5_of_message_attributes: attribute_md5 });
-            }
-            Some(key)
-        } else {
-            None
-        };
-        transaction.execute(
-            "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms, available_at_ms, message_attributes, message_deduplication_id) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![queue_name, body, group_id, ms(now_ms), ms(now_ms).saturating_add(ms(delay_ms.unwrap_or(config.delay_ms))), attributes_json, deduplication_id],
-        )?;
-        let sequence = transaction.last_insert_rowid();
-        let message_id = format!("msg-{sequence:016x}");
-        transaction.execute(
-            "UPDATE messages SET message_id = ?1 WHERE sequence = ?2",
-            params![message_id, sequence],
-        )?;
-        if let Some(key) = deduplication_id {
-            transaction.execute(
-                "INSERT INTO deduplication_keys(queue_name, deduplication_id, message_id, seen_at_ms, group_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![queue_name, key, message_id, ms(now_ms), group_id],
-            )?;
-        }
+        let message_id = insert_message(&transaction, queue_name, &prepared, now_ms)?;
         transaction.commit()?;
         Ok(SendResult {
             message_id,
             deduplicated: false,
-            md5_of_message_attributes: attribute_md5,
+            md5_of_message_attributes: prepared.attribute_md5,
         })
     }
 
@@ -692,58 +434,7 @@ impl Lqs {
             return Err(LqsError::OverLimit);
         }
         let limit = max_messages.min(config.max_in_flight.saturating_sub(in_flight));
-        let mut received: Vec<ReceivedMessage> = Vec::with_capacity(limit);
-        let policy = read_redrive_policy(&transaction, queue_name)?;
-        while received.len() < limit {
-            let Some(candidate) =
-                next_receivable(&transaction, queue_name, config.queue_type, now)?
-            else {
-                break;
-            };
-            if received
-                .iter()
-                .any(|message| message.message_id == candidate.message_id)
-            {
-                break;
-            }
-            if let Some(policy) = &policy
-                && candidate.receive_count >= i64::from(policy.max_receive_count)
-            {
-                let moved = move_message(
-                    &transaction,
-                    candidate.sequence,
-                    &policy.dead_letter_queue,
-                    now,
-                    config.queue_type == QueueType::Fifo,
-                    false,
-                )?;
-                transaction.execute(
-                    "INSERT INTO dead_letter_origins(sequence, source_queue) VALUES (?1, ?2)",
-                    params![moved, queue_name],
-                )?;
-                continue;
-            }
-            let receive_count = candidate.receive_count + 1;
-            let receipt_handle = format!(
-                "receipt-{:016x}-{receive_count:08x}-{now:016x}",
-                candidate.sequence
-            );
-            transaction.execute(
-                "UPDATE messages SET receipt_handle = ?1, invisible_until_ms = ?2, receive_count = ?3, total_receive_count = total_receive_count + 1, first_received_at_ms = COALESCE(first_received_at_ms, ?5) WHERE sequence = ?4",
-                params![receipt_handle, now.saturating_add(ms(visibility)), receive_count, candidate.sequence, now],
-            )?;
-            let (message_attributes, system_attributes) =
-                read_message_metadata(&transaction, candidate.sequence, config.queue_type)?;
-            received.push(ReceivedMessage {
-                message_id: candidate.message_id,
-                receipt_handle,
-                body: candidate.body,
-                message_group_id: candidate.group_id,
-                receive_count: receive_count as u32,
-                message_attributes,
-                system_attributes,
-            });
-        }
+        let received = collect_received(&transaction, queue_name, &config, limit, visibility, now)?;
         let complete = !received.is_empty() || cache_empty;
         if complete {
             save_attempt(
@@ -914,62 +605,448 @@ impl Lqs {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = read_queue_config(&transaction, name)?;
-        let security = current.security.updated(&update.security)?;
-        security_sqlite::write(&transaction, name, &security)?;
-        let visibility = update
-            .visibility_timeout_ms
-            .unwrap_or(current.visibility_timeout_ms);
-        if visibility > 43_200_000 {
-            return Err(LqsError::InvalidVisibilityTimeout);
-        }
-        let delay = update.delay_ms.unwrap_or(current.delay_ms);
-        let retention = update
-            .message_retention_ms
-            .unwrap_or(current.message_retention_ms);
-        let maximum = update
-            .maximum_message_size
-            .unwrap_or(current.maximum_message_size);
-        let wait = update
-            .receive_wait_time_ms
-            .unwrap_or(current.receive_wait_time_ms);
-        let max_in_flight = update.max_in_flight.unwrap_or(current.max_in_flight);
-        validate_delivery_options(delay, retention, maximum)?;
-        validate_receive_options(wait, max_in_flight)?;
+        let resolved = resolve_queue_update(&current, update)?;
+        security_sqlite::write(&transaction, name, &resolved.security)?;
         transaction.execute(
             "UPDATE queues SET visibility_timeout_ms = ?2, modified_at_ms = ?3 WHERE name = ?1",
-            params![name, ms(visibility), ms(now_ms)],
+            params![name, ms(resolved.visibility), ms(now_ms)],
         )?;
-        let content_based = update
-            .content_based_deduplication
-            .unwrap_or(current.content_based_deduplication);
-        let scope = update
-            .deduplication_scope
-            .unwrap_or(current.deduplication_scope);
-        let throughput = update
-            .fifo_throughput_limit
-            .unwrap_or(current.fifo_throughput_limit);
-        validate_fifo(current.queue_type, content_based, scope, throughput)?;
-        if current.queue_type == QueueType::Standard
-            && (update.content_based_deduplication.is_some()
-                || update.deduplication_scope.is_some()
-                || update.fifo_throughput_limit.is_some())
-        {
-            return Err(LqsError::InvalidDeliveryOptions(
-                "FIFO attributes require a FIFO queue".into(),
-            ));
-        }
-        transaction.execute("UPDATE queues SET content_based_deduplication = ?2, deduplication_scope = ?3, fifo_throughput_limit = ?4 WHERE name = ?1", params![name, content_based, scope.as_str(), throughput.as_str()])?;
-        if let Some(policy) = update.redrive_policy {
+        transaction.execute("UPDATE queues SET content_based_deduplication = ?2, deduplication_scope = ?3, fifo_throughput_limit = ?4 WHERE name = ?1", params![name, resolved.content_based, resolved.scope.as_str(), resolved.throughput.as_str()])?;
+        if let Some(policy) = resolved.redrive_policy {
             write_redrive_policy(&transaction, name, policy.as_ref())?;
         }
-        transaction.execute("UPDATE queues SET delay_ms = ?1, message_retention_ms = ?2, maximum_message_size = ?3, receive_wait_time_ms = ?5, max_in_flight = ?6 WHERE name = ?4", params![ms(delay), ms(retention), maximum, name, ms(wait), max_in_flight])?;
-        if current.queue_type == QueueType::Fifo && delay != current.delay_ms {
-            transaction.execute("UPDATE messages SET available_at_ms = MIN(created_at_ms, ?1) + ?2 WHERE queue_name = ?3 AND receive_count = 0", params![i64::MAX - ms(delay), ms(delay), name])?;
+        transaction.execute("UPDATE queues SET delay_ms = ?1, message_retention_ms = ?2, maximum_message_size = ?3, receive_wait_time_ms = ?5, max_in_flight = ?6 WHERE name = ?4", params![ms(resolved.delay), ms(resolved.retention), resolved.maximum, name, ms(resolved.wait), resolved.max_in_flight])?;
+        if current.queue_type == QueueType::Fifo && resolved.delay != current.delay_ms {
+            transaction.execute("UPDATE messages SET available_at_ms = MIN(created_at_ms, ?1) + ?2 WHERE queue_name = ?3 AND receive_count = 0", params![i64::MAX - ms(resolved.delay), ms(resolved.delay), name])?;
         }
         expire_messages(&transaction, name, ms(now_ms))?;
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn create_base_schema(connection: &Connection) -> Result<(), LqsError> {
+    connection.execute_batch(
+        "
+            PRAGMA foreign_keys = ON;
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS queues (
+                name TEXT PRIMARY KEY NOT NULL,
+                queue_type TEXT NOT NULL CHECK(queue_type IN ('standard', 'fifo')),
+                visibility_timeout_ms INTEGER NOT NULL CHECK(visibility_timeout_ms BETWEEN 0 AND 43200000),
+                content_based_deduplication INTEGER NOT NULL CHECK(content_based_deduplication IN (0, 1)),
+                deduplication_window_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT UNIQUE,
+                queue_name TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
+                body TEXT NOT NULL,
+                group_id TEXT,
+                receipt_handle TEXT UNIQUE,
+                invisible_until_ms INTEGER,
+                receive_count INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS messages_by_queue_sequence ON messages(queue_name, sequence);
+            CREATE INDEX IF NOT EXISTS messages_by_fifo_group ON messages(queue_name, group_id, sequence);
+            CREATE TABLE IF NOT EXISTS deduplication_keys (
+                queue_name TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
+                deduplication_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                seen_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(queue_name, deduplication_id)
+            );
+            CREATE TABLE IF NOT EXISTS redrive_policies (
+                source_queue TEXT PRIMARY KEY NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
+                dead_letter_queue TEXT NOT NULL REFERENCES queues(name),
+                max_receive_count INTEGER NOT NULL CHECK(max_receive_count BETWEEN 1 AND 1000),
+                CHECK(source_queue != dead_letter_queue)
+            );
+            CREATE INDEX IF NOT EXISTS redrive_by_target ON redrive_policies(dead_letter_queue, source_queue);
+            CREATE TABLE IF NOT EXISTS dead_letter_origins (
+                sequence INTEGER PRIMARY KEY REFERENCES messages(sequence) ON DELETE CASCADE,
+                source_queue TEXT NOT NULL REFERENCES queues(name)
+            );
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_existing_schema(connection: &mut Connection) -> Result<(), LqsError> {
+    // Additive, transactional migration also upgrades databases from before #4.
+    // The v9 queue CHECK migration rebuilds the parent table without cascading
+    // deletes. Foreign keys are validated before commit and re-enabled below.
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    add_delivery_columns(&transaction)?;
+    transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_created ON messages(queue_name, created_at_ms)")?;
+    transaction.execute_batch("CREATE INDEX IF NOT EXISTS messages_by_queue_inflight ON messages(queue_name, invisible_until_ms)")?;
+    fifo::migrate(&transaction)?;
+    management::migrate(&transaction)?;
+    security_sqlite::migrate(&transaction)?;
+    if transaction
+        .prepare("PRAGMA foreign_key_check")?
+        .exists([])?
+    {
+        return Err(LqsError::Database(
+            "foreign key check failed during migration".into(),
+        ));
+    }
+    transaction.commit()?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(())
+}
+
+fn add_delivery_columns(transaction: &rusqlite::Transaction<'_>) -> Result<(), LqsError> {
+    for (table, column, definition) in [
+        (
+            "queues",
+            "delay_ms",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(delay_ms BETWEEN 0 AND 900000)",
+        ),
+        (
+            "queues",
+            "message_retention_ms",
+            "INTEGER NOT NULL DEFAULT 345600000 CHECK(message_retention_ms BETWEEN 60000 AND 1209600000)",
+        ),
+        (
+            "queues",
+            "maximum_message_size",
+            "INTEGER NOT NULL DEFAULT 1048576 CHECK(maximum_message_size BETWEEN 1024 AND 1048576)",
+        ),
+        ("messages", "available_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "messages",
+            "message_attributes",
+            "TEXT NOT NULL DEFAULT '{}'",
+        ),
+        ("messages", "first_received_at_ms", "INTEGER"),
+        ("messages", "message_deduplication_id", "TEXT"),
+        (
+            "messages",
+            "total_receive_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "queues",
+            "receive_wait_time_ms",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(receive_wait_time_ms BETWEEN 0 AND 20000)",
+        ),
+        (
+            "queues",
+            "max_in_flight",
+            "INTEGER NOT NULL DEFAULT 120000 CHECK(max_in_flight BETWEEN 1 AND 120000)",
+        ),
+    ] {
+        let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|name| name == column) {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))?;
+            if column == "message_deduplication_id" {
+                transaction.execute("UPDATE messages SET message_deduplication_id = (SELECT deduplication_id FROM deduplication_keys WHERE deduplication_keys.queue_name = messages.queue_name AND deduplication_keys.message_id = messages.message_id LIMIT 1)", [])?;
+            }
+            if column == "total_receive_count" {
+                transaction.execute(
+                    "UPDATE messages SET total_receive_count = receive_count",
+                    [],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_queue_creation(
+    name: &str,
+    queue_type: QueueType,
+    options: &QueueOptions,
+    tags: &QueueTags,
+) -> Result<(), LqsError> {
+    options.security.validate()?;
+    management::validate_tags(tags)?;
+    if queue_type == QueueType::Fifo && !name.ends_with(".fifo") {
+        return Err(LqsError::InvalidFifoName(name.to_owned()));
+    }
+    if queue_type == QueueType::Standard && name.ends_with(".fifo") {
+        return Err(LqsError::InvalidStandardName(name.to_owned()));
+    }
+    if options.visibility_timeout_ms > 43_200_000 {
+        return Err(LqsError::InvalidVisibilityTimeout);
+    }
+    validate_delivery_options(
+        options.delay_ms,
+        options.message_retention_ms,
+        options.maximum_message_size,
+    )?;
+    validate_receive_options(options.receive_wait_time_ms, options.max_in_flight)?;
+    validate_fifo(
+        queue_type,
+        options.content_based_deduplication,
+        options.deduplication_scope,
+        options.fifo_throughput_limit,
+    )?;
+    if options.deduplication_window_ms != 300_000 {
+        return Err(LqsError::InvalidDeliveryOptions(
+            "deduplication window is fixed at 300000ms".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_queue(
+    transaction: &rusqlite::Transaction<'_>,
+    name: &str,
+    queue_type: QueueType,
+    options: &QueueOptions,
+    tags: &QueueTags,
+    now_ms: u64,
+) -> Result<(), LqsError> {
+    let result = transaction.execute(
+        "INSERT INTO queues(name, queue_type, visibility_timeout_ms, content_based_deduplication, deduplication_window_ms, delay_ms, message_retention_ms, maximum_message_size, receive_wait_time_ms, max_in_flight)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![name, queue_type.as_db_value(), ms(options.visibility_timeout_ms), i64::from(options.content_based_deduplication), ms(options.deduplication_window_ms), ms(options.delay_ms), ms(options.message_retention_ms), options.maximum_message_size, ms(options.receive_wait_time_ms), options.max_in_flight],
+    );
+    match result {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(error, _)) if error.extended_code == 1555 => {
+            return Err(LqsError::QueueAlreadyExists(name.to_owned()));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    security_sqlite::write(transaction, name, &options.security)?;
+    transaction.execute(
+        "UPDATE queues SET created_at_ms = ?2, modified_at_ms = ?2 WHERE name = ?1",
+        params![name, ms(now_ms)],
+    )?;
+    management::write_tags(transaction, name, tags)?;
+    transaction.execute(
+        "UPDATE queues SET deduplication_scope = ?2, fifo_throughput_limit = ?3 WHERE name = ?1",
+        params![
+            name,
+            options.deduplication_scope.as_str(),
+            options.fifo_throughput_limit.as_str()
+        ],
+    )?;
+    write_redrive_policy(transaction, name, options.redrive_policy.as_ref())?;
+    Ok(())
+}
+
+struct ResolvedQueueUpdate {
+    security: QueueSecurity,
+    visibility: u64,
+    delay: u64,
+    retention: u64,
+    maximum: usize,
+    wait: u64,
+    max_in_flight: usize,
+    content_based: bool,
+    scope: DeduplicationScope,
+    throughput: FifoThroughputLimit,
+    redrive_policy: Option<Option<RedrivePolicy>>,
+}
+
+fn resolve_queue_update(
+    current: &QueueConfig,
+    update: QueueUpdate,
+) -> Result<ResolvedQueueUpdate, LqsError> {
+    let security = current.security.updated(&update.security)?;
+    let visibility = update
+        .visibility_timeout_ms
+        .unwrap_or(current.visibility_timeout_ms);
+    if visibility > 43_200_000 {
+        return Err(LqsError::InvalidVisibilityTimeout);
+    }
+    let delay = update.delay_ms.unwrap_or(current.delay_ms);
+    let retention = update
+        .message_retention_ms
+        .unwrap_or(current.message_retention_ms);
+    let maximum = update
+        .maximum_message_size
+        .unwrap_or(current.maximum_message_size);
+    let wait = update
+        .receive_wait_time_ms
+        .unwrap_or(current.receive_wait_time_ms);
+    let max_in_flight = update.max_in_flight.unwrap_or(current.max_in_flight);
+    validate_delivery_options(delay, retention, maximum)?;
+    validate_receive_options(wait, max_in_flight)?;
+    let content_based = update
+        .content_based_deduplication
+        .unwrap_or(current.content_based_deduplication);
+    let scope = update
+        .deduplication_scope
+        .unwrap_or(current.deduplication_scope);
+    let throughput = update
+        .fifo_throughput_limit
+        .unwrap_or(current.fifo_throughput_limit);
+    validate_fifo(current.queue_type, content_based, scope, throughput)?;
+    if current.queue_type == QueueType::Standard
+        && (update.content_based_deduplication.is_some()
+            || update.deduplication_scope.is_some()
+            || update.fifo_throughput_limit.is_some())
+    {
+        return Err(LqsError::InvalidDeliveryOptions(
+            "FIFO attributes require a FIFO queue".into(),
+        ));
+    }
+    Ok(ResolvedQueueUpdate {
+        security,
+        visibility,
+        delay,
+        retention,
+        maximum,
+        wait,
+        max_in_flight,
+        content_based,
+        scope,
+        throughput,
+        redrive_policy: update.redrive_policy,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PreparedSend {
+    body: String,
+    group_id: Option<String>,
+    deduplication_id: Option<String>,
+    delay_ms: u64,
+    attributes_json: String,
+    attribute_md5: Option<String>,
+}
+
+// All validation and normalization depend only on the request and queue settings.
+fn prepare_send(request: SendRequest, config: &QueueConfig) -> Result<PreparedSend, LqsError> {
+    let SendRequest {
+        body,
+        message_group_id,
+        deduplication_id,
+        delay_ms,
+        mut message_attributes,
+    } = request;
+    let size = body
+        .len()
+        .saturating_add(message_attributes_size(&message_attributes));
+    if body.is_empty() || size > config.maximum_message_size {
+        return Err(LqsError::InvalidMessageSize {
+            size,
+            maximum: config.maximum_message_size,
+        });
+    }
+    validate_message_attributes(&mut message_attributes)?;
+    // Normalizing a Number can expand exponent notation; validate the stored size too.
+    let normalized_size = body
+        .len()
+        .saturating_add(message_attributes_size(&message_attributes));
+    if normalized_size > config.maximum_message_size {
+        return Err(LqsError::InvalidMessageSize {
+            size: normalized_size,
+            maximum: config.maximum_message_size,
+        });
+    }
+    let attribute_md5 = message_attributes_md5(&message_attributes);
+    let attributes_json = serde_json::to_string(&message_attributes)
+        .map_err(|error| LqsError::Database(error.to_string()))?;
+    if let Some(delay) = delay_ms
+        && (config.queue_type == QueueType::Fifo || delay > 900_000)
+    {
+        return Err(LqsError::InvalidDeliveryOptions(
+            "message delay must be 0-900000ms and is only allowed for Standard queues".into(),
+        ));
+    }
+    let group_id = match config.queue_type {
+        QueueType::Standard => message_group_id,
+        QueueType::Fifo => {
+            let group = message_group_id.ok_or(LqsError::FifoRequiresGroupId)?;
+            if group.is_empty() {
+                return Err(LqsError::EmptyGroupId);
+            }
+            Some(group)
+        }
+    };
+    for (name, value) in [
+        ("MessageGroupId", group_id.as_deref()),
+        ("MessageDeduplicationId", deduplication_id.as_deref()),
+    ] {
+        if let Some(value) = value
+            && (!(1..=128).contains(&value.len()) || !value.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err(LqsError::InvalidMessageIdentifier(name));
+        }
+    }
+    if config.queue_type == QueueType::Standard && deduplication_id.is_some() {
+        return Err(LqsError::InvalidDeliveryOptions(
+            "MessageDeduplicationId is only allowed for FIFO queues".into(),
+        ));
+    }
+    let deduplication_id = if config.queue_type == QueueType::Fifo {
+        Some(match deduplication_id {
+            Some(value) => value,
+            None if config.content_based_deduplication => stable_content_id(&body),
+            None => return Err(LqsError::DeduplicationIdRequired),
+        })
+    } else {
+        None
+    };
+    Ok(PreparedSend {
+        body,
+        group_id,
+        deduplication_id,
+        delay_ms: delay_ms.unwrap_or(config.delay_ms),
+        attributes_json,
+        attribute_md5,
+    })
+}
+
+fn find_duplicate(
+    transaction: &rusqlite::Transaction<'_>,
+    queue_name: &str,
+    config: &QueueConfig,
+    prepared: &PreparedSend,
+    now_ms: u64,
+) -> Result<Option<String>, LqsError> {
+    let Some(key) = &prepared.deduplication_id else {
+        return Ok(None);
+    };
+    if now_ms >= config.deduplication_window_ms {
+        transaction.execute(
+            "DELETE FROM deduplication_keys WHERE queue_name = ?1 AND seen_at_ms <= ?2",
+            params![queue_name, ms(now_ms - config.deduplication_window_ms)],
+        )?;
+    }
+    Ok(transaction.query_row(
+        "SELECT message_id FROM deduplication_keys WHERE queue_name = ?1 AND deduplication_id = ?2 AND (?3 = 'queue' OR group_id = ?4 OR group_id = '') ORDER BY seen_at_ms, message_id LIMIT 1",
+        params![queue_name, key, config.deduplication_scope.as_str(), prepared.group_id],
+        |row| row.get(0),
+    ).optional()?)
+}
+
+fn insert_message(
+    transaction: &rusqlite::Transaction<'_>,
+    queue_name: &str,
+    prepared: &PreparedSend,
+    now_ms: u64,
+) -> Result<String, LqsError> {
+    transaction.execute(
+        "INSERT INTO messages(message_id, queue_name, body, group_id, created_at_ms, available_at_ms, message_attributes, message_deduplication_id) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![queue_name, prepared.body, prepared.group_id, ms(now_ms), ms(now_ms).saturating_add(ms(prepared.delay_ms)), prepared.attributes_json, prepared.deduplication_id],
+    )?;
+    let sequence = transaction.last_insert_rowid();
+    let message_id = format!("msg-{sequence:016x}");
+    transaction.execute(
+        "UPDATE messages SET message_id = ?1 WHERE sequence = ?2",
+        params![message_id, sequence],
+    )?;
+    if let Some(key) = &prepared.deduplication_id {
+        transaction.execute(
+            "INSERT INTO deduplication_keys(queue_name, deduplication_id, message_id, seen_at_ms, group_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![queue_name, key, message_id, ms(now_ms), prepared.group_id],
+        )?;
+    }
+    Ok(message_id)
 }
 
 fn read_queue_config(connection: &Connection, queue_name: &str) -> Result<QueueConfig, LqsError> {
@@ -1169,6 +1246,123 @@ struct Candidate {
     receive_count: i64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CandidateAction<'a> {
+    Stop,
+    Redrive(&'a RedrivePolicy),
+    Deliver,
+}
+
+fn candidate_action<'a>(
+    candidate: &Candidate,
+    received: &[ReceivedMessage],
+    policy: Option<&'a RedrivePolicy>,
+) -> CandidateAction<'a> {
+    if received
+        .iter()
+        .any(|message| message.message_id == candidate.message_id)
+    {
+        CandidateAction::Stop
+    } else if let Some(policy) = policy
+        && candidate.receive_count >= i64::from(policy.max_receive_count)
+    {
+        CandidateAction::Redrive(policy)
+    } else {
+        CandidateAction::Deliver
+    }
+}
+
+fn collect_received(
+    transaction: &rusqlite::Transaction<'_>,
+    queue_name: &str,
+    config: &QueueConfig,
+    limit: usize,
+    visibility_ms: u64,
+    now: i64,
+) -> Result<Vec<ReceivedMessage>, LqsError> {
+    let mut received = Vec::with_capacity(limit);
+    let policy = read_redrive_policy(transaction, queue_name)?;
+    while received.len() < limit {
+        let Some(candidate) = next_receivable(transaction, queue_name, config.queue_type, now)?
+        else {
+            break;
+        };
+        match candidate_action(&candidate, &received, policy.as_ref()) {
+            CandidateAction::Stop => break,
+            CandidateAction::Redrive(policy) => {
+                redrive_candidate(
+                    transaction,
+                    queue_name,
+                    config.queue_type,
+                    &candidate,
+                    policy,
+                    now,
+                )?;
+            }
+            CandidateAction::Deliver => received.push(deliver_candidate(
+                transaction,
+                config.queue_type,
+                candidate,
+                visibility_ms,
+                now,
+            )?),
+        }
+    }
+    Ok(received)
+}
+
+fn redrive_candidate(
+    transaction: &rusqlite::Transaction<'_>,
+    queue_name: &str,
+    queue_type: QueueType,
+    candidate: &Candidate,
+    policy: &RedrivePolicy,
+    now: i64,
+) -> Result<(), LqsError> {
+    let moved = move_message(
+        transaction,
+        candidate.sequence,
+        &policy.dead_letter_queue,
+        now,
+        queue_type == QueueType::Fifo,
+        false,
+    )?;
+    transaction.execute(
+        "INSERT INTO dead_letter_origins(sequence, source_queue) VALUES (?1, ?2)",
+        params![moved, queue_name],
+    )?;
+    Ok(())
+}
+
+fn deliver_candidate(
+    transaction: &rusqlite::Transaction<'_>,
+    queue_type: QueueType,
+    candidate: Candidate,
+    visibility_ms: u64,
+    now: i64,
+) -> Result<ReceivedMessage, LqsError> {
+    let receive_count = candidate.receive_count + 1;
+    let receipt_handle = format!(
+        "receipt-{:016x}-{receive_count:08x}-{now:016x}",
+        candidate.sequence
+    );
+    transaction.execute(
+        "UPDATE messages SET receipt_handle = ?1, invisible_until_ms = ?2, receive_count = ?3, total_receive_count = total_receive_count + 1, first_received_at_ms = COALESCE(first_received_at_ms, ?5) WHERE sequence = ?4",
+        params![receipt_handle, now.saturating_add(ms(visibility_ms)), receive_count, candidate.sequence, now],
+    )?;
+    let (message_attributes, system_attributes) =
+        read_message_metadata(transaction, candidate.sequence, queue_type)?;
+    Ok(ReceivedMessage {
+        message_id: candidate.message_id,
+        receipt_handle,
+        body: candidate.body,
+        message_group_id: candidate.group_id,
+        receive_count: receive_count as u32,
+        message_attributes,
+        system_attributes,
+    })
+}
+
 fn next_receivable(
     transaction: &rusqlite::Transaction<'_>,
     queue_name: &str,
@@ -1260,6 +1454,119 @@ fn stable_content_id(body: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn config(kind: QueueType) -> QueueConfig {
+        let defaults = QueueOptions::default();
+        QueueConfig {
+            security: defaults.security,
+            deduplication_scope: defaults.deduplication_scope,
+            fifo_throughput_limit: defaults.fifo_throughput_limit,
+            queue_type: kind,
+            visibility_timeout_ms: defaults.visibility_timeout_ms,
+            content_based_deduplication: kind == QueueType::Fifo,
+            deduplication_window_ms: defaults.deduplication_window_ms,
+            redrive_policy: defaults.redrive_policy,
+            delay_ms: defaults.delay_ms,
+            message_retention_ms: defaults.message_retention_ms,
+            maximum_message_size: defaults.maximum_message_size,
+            receive_wait_time_ms: defaults.receive_wait_time_ms,
+            max_in_flight: defaults.max_in_flight,
+        }
+    }
+
+    #[test]
+    fn send_preparation_is_deterministic_without_a_database() {
+        let settings = config(QueueType::Fifo);
+        let request = SendRequest::fifo("payload", "group");
+        let first = prepare_send(request.clone(), &settings).unwrap();
+        assert_eq!(first, prepare_send(request, &settings).unwrap());
+        assert_eq!(first.deduplication_id, Some(stable_content_id("payload")));
+        assert_eq!(first.group_id.as_deref(), Some("group"));
+        assert_eq!(
+            prepare_send(SendRequest::fifo("payload", ""), &settings),
+            Err(LqsError::EmptyGroupId)
+        );
+    }
+
+    #[test]
+    fn queue_update_resolution_validates_before_storage() {
+        let current = config(QueueType::Standard);
+        let resolved = resolve_queue_update(
+            &current,
+            QueueUpdate {
+                delay_ms: Some(900_000),
+                ..QueueUpdate::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.delay, 900_000);
+        assert_eq!(resolved.visibility, current.visibility_timeout_ms);
+        assert!(matches!(
+            resolve_queue_update(
+                &current,
+                QueueUpdate {
+                    content_based_deduplication: Some(true),
+                    ..QueueUpdate::default()
+                }
+            ),
+            Err(LqsError::InvalidDeliveryOptions(_))
+        ));
+    }
+
+    #[test]
+    fn candidate_decision_keeps_duplicate_and_redrive_boundaries_distinct() {
+        let candidate = Candidate {
+            sequence: 1,
+            message_id: "m1".into(),
+            body: "payload".into(),
+            group_id: Some("group".into()),
+            receive_count: 2,
+        };
+        let policy = RedrivePolicy {
+            dead_letter_queue: "dlq.fifo".into(),
+            max_receive_count: 2,
+        };
+        assert_eq!(
+            candidate_action(&candidate, &[], Some(&policy)),
+            CandidateAction::Redrive(&policy)
+        );
+        let already_received = ReceivedMessage {
+            message_id: "m1".into(),
+            receipt_handle: "receipt".into(),
+            body: "payload".into(),
+            message_group_id: Some("group".into()),
+            receive_count: 3,
+            message_attributes: MessageAttributes::new(),
+            system_attributes: Default::default(),
+        };
+        assert_eq!(
+            candidate_action(&candidate, &[already_received], Some(&policy)),
+            CandidateAction::Stop
+        );
+        assert_eq!(
+            candidate_action(&candidate, &[], None),
+            CandidateAction::Deliver
+        );
+    }
+
+    #[test]
+    fn candidate_query_can_be_verified_independently_of_batch_delivery() {
+        let mut lqs = fifo();
+        lqs.send("orders.fifo", SendRequest::fifo("a-1", "a"), 0)
+            .unwrap();
+        lqs.send("orders.fifo", SendRequest::fifo("a-2", "a"), 1)
+            .unwrap();
+        lqs.send("orders.fifo", SendRequest::fifo("b-1", "b"), 2)
+            .unwrap();
+        let first = lqs.receive("orders.fifo", 1, 3).unwrap();
+        assert_eq!(first[0].body, "a-1");
+
+        let transaction = lqs.connection.transaction().unwrap();
+        let candidate = next_receivable(&transaction, "orders.fifo", QueueType::Fifo, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.body, "b-1");
+    }
 
     fn fifo() -> Lqs {
         let mut lqs = Lqs::new();
