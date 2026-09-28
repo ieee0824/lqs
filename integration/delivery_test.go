@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,9 +14,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
+var deliveryQueueSequence atomic.Uint64
+
 func deliveryQueue(t *testing.T, client *sqs.Client, ctx context.Context, attributes map[string]string) *string {
 	t.Helper()
-	name := fmt.Sprintf("delivery-%d", time.Now().UnixNano())
+	name := fmt.Sprintf("delivery-%d-%d", time.Now().UnixNano(), deliveryQueueSequence.Add(1))
 	if attributes["FifoQueue"] == "true" {
 		name += ".fifo"
 	}

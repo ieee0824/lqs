@@ -166,7 +166,7 @@ fn fifo_batch_matches_single_send_order_deduplication_and_validation() {
             .deduplicated
     );
     for body in ["first", "second", "third"] {
-        let messages = lqs.receive("q.fifo", 10, 3).unwrap();
+        let messages = lqs.receive("q.fifo", 1, 3).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].body, body);
         lqs.delete("q.fifo", &messages[0].receipt_handle).unwrap();
@@ -277,7 +277,7 @@ fn database_failure_rolls_back_only_its_entry_and_successes_survive_reopen() {
     {
         let mut lqs = Lqs::open(&path).unwrap();
         for body in ["before", "after"] {
-            let received = lqs.receive("q.fifo", 10, 1).unwrap();
+            let received = lqs.receive("q.fifo", 1, 1).unwrap();
             assert_eq!(received.len(), 1);
             assert_eq!(received[0].body, body);
             lqs.delete("q.fifo", &received[0].receipt_handle).unwrap();

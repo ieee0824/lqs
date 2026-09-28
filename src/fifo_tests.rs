@@ -20,6 +20,119 @@ fn attempt(id: &str) -> ReceiveOptions {
 }
 
 #[test]
+fn one_receive_returns_a_same_group_batch_and_replay_keeps_the_batch() {
+    let mut lqs = Lqs::new();
+    fifo_queue(&mut lqs, DeduplicationScope::Queue);
+    for body in ["M1", "M2", "M3", "M4"] {
+        lqs.send("q.fifo", SendRequest::fifo(body, "g"), 0).unwrap();
+    }
+
+    let first = lqs
+        .receive_with_options("q.fifo", 10, attempt("batch"), 1)
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect::<Vec<_>>(),
+        ["M1", "M2", "M3", "M4"]
+    );
+    let metrics = lqs.queue_metrics("q.fifo", 1).unwrap();
+    assert_eq!((metrics.visible, metrics.not_visible), (0, 4));
+    assert!(lqs.receive("q.fifo", 10, 2).unwrap().is_empty());
+    assert_eq!(
+        lqs.receive_with_options("q.fifo", 10, attempt("batch"), 3)
+            .unwrap(),
+        first
+    );
+}
+
+#[test]
+fn a_prior_receive_blocks_only_its_group_while_another_group_batches() {
+    let mut lqs = Lqs::new();
+    fifo_queue(&mut lqs, DeduplicationScope::Queue);
+    for (body, group) in [("a-1", "a"), ("b-1", "b"), ("a-2", "a"), ("b-2", "b")] {
+        lqs.send("q.fifo", SendRequest::fifo(body, group), 0)
+            .unwrap();
+    }
+    let first = lqs.receive("q.fifo", 1, 1).unwrap();
+    assert_eq!(first[0].body, "a-1");
+    let second = lqs.receive("q.fifo", 10, 2).unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect::<Vec<_>>(),
+        ["b-1", "b-2"]
+    );
+    lqs.delete("q.fifo", &first[0].receipt_handle).unwrap();
+    assert_eq!(lqs.receive("q.fifo", 10, 3).unwrap()[0].body, "a-2");
+}
+
+#[test]
+fn a_batch_prefers_its_current_group_and_stops_at_ten() {
+    let mut lqs = Lqs::new();
+    fifo_queue(&mut lqs, DeduplicationScope::Queue);
+    for (body, group) in [("a-1", "a"), ("b-1", "b"), ("a-2", "a")] {
+        lqs.send("q.fifo", SendRequest::fifo(body, group), 0)
+            .unwrap();
+    }
+    let first = lqs.receive("q.fifo", 10, 1).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect::<Vec<_>>(),
+        ["a-1", "a-2", "b-1"]
+    );
+
+    for index in 0..11 {
+        lqs.send(
+            "q.fifo",
+            SendRequest::fifo(format!("next-{index}"), "next"),
+            2,
+        )
+        .unwrap();
+    }
+    let batch = lqs.receive("q.fifo", 10, 3).unwrap();
+    assert_eq!(batch.len(), 10);
+    assert_eq!(batch[0].body, "next-0");
+    assert_eq!(batch[9].body, "next-9");
+    assert!(lqs.receive("q.fifo", 10, 4).unwrap().is_empty());
+    for message in batch {
+        lqs.delete("q.fifo", &message.receipt_handle).unwrap();
+    }
+    assert_eq!(lqs.receive("q.fifo", 10, 5).unwrap()[0].body, "next-10");
+}
+
+#[test]
+fn zero_visibility_batch_does_not_repeat_a_message() {
+    let mut lqs = Lqs::new();
+    fifo_queue(&mut lqs, DeduplicationScope::Queue);
+    for body in ["one", "two", "three"] {
+        lqs.send("q.fifo", SendRequest::fifo(body, "g"), 0).unwrap();
+    }
+    let options = ReceiveOptions {
+        visibility_timeout_ms: Some(0),
+        ..ReceiveOptions::default()
+    };
+    let batch = lqs
+        .receive_with_options("q.fifo", 10, options.clone(), 1)
+        .unwrap();
+    assert_eq!(
+        batch
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "two", "three"]
+    );
+    assert_eq!(lqs.queue_metrics("q.fifo", 1).unwrap().not_visible, 0);
+    let again = lqs.receive_with_options("q.fifo", 10, options, 2).unwrap();
+    assert_eq!(again.len(), 3);
+    assert!(again.iter().all(|message| message.receive_count == 2));
+}
+
+#[test]
 fn sha256_explicit_override_deleted_keys_and_fixed_window() {
     let mut lqs = Lqs::new();
     fifo_queue(&mut lqs, DeduplicationScope::Queue);

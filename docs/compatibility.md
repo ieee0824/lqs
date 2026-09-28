@@ -116,6 +116,8 @@ in-flight上限はキューごとに既定120,000件です。ローカル検証�
 
 `perMessageGroupId`には`messageGroup`が必須です。設定の組み合わせは更新後の値で検証し、不正なら全属性を変更しません。`messageGroup`では同じ重複排除IDでもグループが異なれば別メッセージとして受理します。LQSは設定と重複排除範囲をモデル化しますが、AWSのリージョン別TPS制限・パーティション分散は再現しません。
 
+FIFOの`ReceiveMessage`は、同じ`MessageGroupId`から順序どおり最大`MaxNumberOfMessages`件を1回の応答で返します。その応答のメッセージがin-flightの間、別の受信では同じグループの後続メッセージを返しません。別グループのメッセージは受信できます。
+
 FIFOの`ReceiveMessage.ReceiveRequestAttemptId`には1〜128文字のASCII英数字・記号を指定できます。同じIDの再試行は初回応答から5分間、同じメッセージ・receipt handle・受信回数を返し、可視性期限をリセットします。受信結果はSQLiteに保存するため再起動・別接続でも有効です。空の応答も保存し、ロングポーリングの空応答は待機終了時に確定します。初回受信で使った`MaxNumberOfMessages`と`VisibilityTimeout`（省略を含む）は再試行でも同じ指定にしてください。
 
 対象の一部でも削除・可視性変更・別リクエストでの再受信・DLQ転送・保持期限切れが起きた場合、LQSはそのIDの再試行を`InvalidParameterValue`で拒否します。期限切れ後は同じIDを新しい受信として扱います。`VisibilityTimeout`は受信単位に0〜43,200秒で指定できます。Rustでは`receive_with_options`と`ReceiveOptions`を使用します。受信済み結果の再試行はin-flight上限到達時も可能ですが、可視性が切れたメッセージを再びin-flightにする際にローカル上限を超える場合は`OverLimit`です。

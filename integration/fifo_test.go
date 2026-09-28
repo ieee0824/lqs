@@ -16,6 +16,47 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
+func TestFIFOReceiveBatchFromOneGroup(t *testing.T) {
+	t.Parallel()
+	client := newSQSClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	queue := deliveryQueue(t, client, ctx, map[string]string{"FifoQueue": "true", "ContentBasedDeduplication": "true"})
+	for _, body := range []string{"M1", "M2", "M3", "M4"} {
+		_, err := client.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: queue, MessageBody: aws.String(body), MessageGroupId: aws.String("g")})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	wire := postQuery(t, lqsEndpoint(), url.Values{
+		"Action": {"ReceiveMessage"}, "QueueUrl": {*queue},
+		"MaxNumberOfMessages": {"10"}, "VisibilityTimeout": {"30"},
+	})
+	var batch struct {
+		Messages []struct {
+			Body string `xml:"Body"`
+		} `xml:"ReceiveMessageResult>Message"`
+	}
+	if err := xml.Unmarshal(wire, &batch); err != nil {
+		t.Fatal(err)
+	}
+	bodies := make([]string, 0, len(batch.Messages))
+	for _, message := range batch.Messages {
+		bodies = append(bodies, message.Body)
+	}
+	if !reflect.DeepEqual(bodies, []string{"M1", "M2", "M3", "M4"}) {
+		t.Fatalf("same-group batch: %v", bodies)
+	}
+	attrs := pollingAttributes(t, client, ctx, queue)
+	if attrs["ApproximateNumberOfMessages"] != "0" || attrs["ApproximateNumberOfMessagesNotVisible"] != "4" {
+		t.Fatalf("post-batch attributes: %v", attrs)
+	}
+	next, err := client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{QueueUrl: queue, MaxNumberOfMessages: 10})
+	if err != nil || len(next.Messages) != 0 {
+		t.Fatalf("in-flight group returned more messages: %+v %v", next, err)
+	}
+}
+
 func TestFIFOHighThroughputAndSHA256(t *testing.T) {
 	t.Parallel()
 	client := newSQSClient(t)

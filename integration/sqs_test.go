@@ -68,11 +68,13 @@ func TestAWSSDKV2FIFOEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReceiveMessage(first): %v", err)
 	}
-	if len(first.Messages) != 2 {
-		t.Fatalf("first receive returned %d messages, want 2: %#v", len(first.Messages), first.Messages)
+	if len(first.Messages) != 3 {
+		t.Fatalf("first receive returned %d messages, want 3: %#v", len(first.Messages), first.Messages)
 	}
 	a1 := findMessage(t, first.Messages, "a-1")
+	a2 := findMessage(t, first.Messages, "a-2")
 	b1 := findMessage(t, first.Messages, "b-1")
+	send("a-3", "a")
 
 	_, err = client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
 		QueueUrl:          queueURL,
@@ -96,6 +98,15 @@ func TestAWSSDKV2FIFOEndToEnd(t *testing.T) {
 	deleteMessage(t, ctx, client, queueURL, retried.Messages[0].ReceiptHandle)
 	deleteMessage(t, ctx, client, queueURL, a1.ReceiptHandle)
 
+	blocked, err := client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+		QueueUrl:            queueURL,
+		MaxNumberOfMessages: 10,
+	})
+	if err != nil || len(blocked.Messages) != 0 {
+		t.Fatalf("a-2 must keep its group blocked: %#v %v", blocked.Messages, err)
+	}
+	deleteMessage(t, ctx, client, queueURL, a2.ReceiptHandle)
+
 	next, err := client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            queueURL,
 		MaxNumberOfMessages: 10,
@@ -103,7 +114,7 @@ func TestAWSSDKV2FIFOEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReceiveMessage(next): %v", err)
 	}
-	if len(next.Messages) != 1 || aws.ToString(next.Messages[0].Body) != "a-2" {
+	if len(next.Messages) != 1 || aws.ToString(next.Messages[0].Body) != "a-3" {
 		t.Fatalf("next receive returned unexpected messages: %#v", next.Messages)
 	}
 	deleteMessage(t, ctx, client, queueURL, next.Messages[0].ReceiptHandle)
