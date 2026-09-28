@@ -196,7 +196,7 @@ Rustでは`list_queues`、`queue_exists`、`queue_metrics`、`tag_queue`、`unta
 
 ### HTTP受付制限
 
-`LQS_MAX_IN_FLIGHT`（既定128）は同時に処理するリクエスト数を制限し、ロングポーリングも応答または切断まで枠を保持します。超過時はHTTP 503 `ServiceUnavailable`です。`LQS_REQUESTS_PER_SECOND`（既定100）はトークンバケットで同数のバーストを許容し、超過時はHTTP 429 `RequestThrottled`です。両制限は本文の読み取り・認証より前に適用されるため、認証失敗も受付レートに数えます。`/health`も制限対象です。
+`LQS_MAX_IN_FLIGHT`（既定128）は同時に処理するリクエスト数を制限し、ロングポーリングも応答または切断まで枠を保持します。超過時はHTTP 503 `ServiceUnavailable`です。`LQS_REQUESTS_PER_SECOND`（既定1000）はトークンバケットで同数のバーストを許容し、超過時はHTTP 429 `RequestThrottled`です。両制限は本文の読み取り・認証より前に適用されるため、認証失敗も受付レートに数えます。`/health`も制限対象です。
 
 `LQS_BODY_READ_TIMEOUT_MS`（既定5000）は本文を読み終えるまでの期限です。低速送信が期限を超えるとHTTP 408 `RequestTimeout`になります。本文読取後の処理と最大20秒のReceiveMessageロングポーリングはこの期限に含みません。制限値はすべて正の整数で指定します。
 
@@ -204,6 +204,16 @@ Rustでは`list_queues`、`queue_exists`、`queue_metrics`、`tag_queue`、`unta
 
 `SqsManagedSseEnabled`（既定false）、`KmsMasterKeyId`、`KmsDataKeyReusePeriodSeconds`（60〜86,400秒、既定300）をCreate/Set/Getで保持します。SSE-SQSとKMSを同時に有効化できません。KMSキー指定はSSE-SQSを無効化し、SSE-SQSの有効化はKMSキーを解除します。空のKmsMasterKeyIdはKMSを解除します。キーは識別子として保存するだけで、実在性・キーへの権限は確認しません。
 
-**メッセージ本文・属性・FIFO受信キャッシュ・SQLite/WAL/バックアップはすべて平文のままです。** 暗号化・復号、AWS KMS呼び出し、データキー生成/キャッシュ/ローテーションは行いません。キュー属性の`SqsManagedSseEnabled=true`は要求された構成を示すだけです。実暗号化を誤認させないため、受信メッセージのシステム属性`SqsManagedSseEnabled`はfalseのままです。ポリシーと暗号化設定はPurgeで維持し、DeleteQueueで削除します。
+これらのSQS属性は**構成シミュレーション**で、AWS KMS呼び出し、データキー生成/キャッシュ/ローテーションを行いません。`SqsManagedSseEnabled=true`だけでは保存時暗号化は有効になりません。受信メッセージのシステム属性`SqsManagedSseEnabled`はfalseのままです。ポリシーとSQS暗号化設定はPurgeで維持し、DeleteQueueで削除します。
+
+### SQLCipherによる保存時暗号化
+
+`LQS_DATABASE_KEY_FILE`に32〜128バイトの鍵ファイルを指定すると、SQLCipherでSQLiteのページを暗号化します。メッセージ本文、属性、FIFO受信キャッシュを含むDBとWALが保護対象です。平文モードではそれらは平文です。鍵はファイルから起動時に読み取り、コマンド引数やログへ出しません。Unixでは鍵ファイルと既存の暗号化DBに所有者以外の権限があると起動を拒否し、新規DBを0600で作成します。一時SQLiteファイルには`temp_store=MEMORY`を使います。プロセスメモリ、スワップ、クラッシュダンプ、通信中の本文は保存時暗号化の保護対象外です。
+
+`GET /status`は`{"storageEncryption":"none"|"sqlcipher","sqsEncryptionSettings":"simulation"}`を返します。これは実際のDBモードとSQS属性のシミュレーションを別々に示します。ライブラリの`Lqs::storage_encryption()`でも同じDB状態を取得できます。鍵を指定しない起動で暗号化DBを開くこと、鍵未提供・誤鍵での復号は失敗します。鍵を失うと復旧できないため、DBバックアップと鍵のバックアップを別々に安全に管理してください。鍵ローテーションは自動では行いません。
+
+既存の平文DBは起動時に自動変換しません。サーバーを停止し、鍵ファイルを作成したうえで`lqs migrate-plaintext <source-db> <new-target-db> <key-file>`を実行します。移行処理はWALをチェックポイントし、[SQLCipherの`sqlcipher_export`](https://www.zetetic.net/sqlcipher/sqlcipher-api/#sqlcipher_export)で新しい暗号化DBへコピーします。移行元は残し、移行先が既にあれば上書きしません。移行後に鍵を指定してサーバーを起動し、データを確認してください。平文の移行元、古いバックアップ、コピー、スナップショットは自動消去しません。
+
+バックアップはサーバー停止後に暗号化DBをコピーし、同じ鍵を安全に保管してください。稼働中のDB単体をコピーするとWALの未反映データを失う可能性があります。平文DBをバックアップする場合は内容も平文です。復元先でも鍵と0600権限が必要です。移行・バックアップ時にはDBを含むディレクトリを信頼できる利用者だけがアクセス可能にしてください。
 
 仕様参考: [SQSの操作と権限対応](https://docs.aws.amazon.com/service-authorization/latest/reference/list_sqs.html)、[AddPermission](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_AddPermission.html)、[SetQueueAttributes](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html)。

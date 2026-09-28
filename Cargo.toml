@@ -9,7 +9,7 @@ base64 = "0.22"
 md5 = "0.8"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }

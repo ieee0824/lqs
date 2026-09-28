@@ -49,7 +49,7 @@ const DEFAULT_DATABASE_PATH: &str = "lqs.sqlite";
 // A 1 MiB decoded body can expand up to 6x in JSON, or 3x in Query encoding.
 const MAX_REQUEST_BYTES: usize = 8 * 1_048_576;
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
-const DEFAULT_REQUESTS_PER_SECOND: u32 = 100;
+const DEFAULT_REQUESTS_PER_SECOND: u32 = 1_000;
 const DEFAULT_BODY_READ_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug)]
@@ -89,6 +89,7 @@ pub struct ServerConfig {
     pub bearer_credential: Option<String>,
     pub auth_principal: Option<String>,
     pub http_limits: HttpLimits,
+    pub database_key_file: Option<PathBuf>,
     pub bind_addr: SocketAddr,
     pub database_path: PathBuf,
     pub public_base_url: String,
@@ -109,6 +110,7 @@ impl fmt::Debug for ServerConfig {
             )
             .field("auth_principal", &self.auth_principal)
             .field("http_limits", &self.http_limits)
+            .field("database_key_file", &self.database_key_file)
             .field("bind_addr", &self.bind_addr)
             .field("database_path", &self.database_path)
             .field("public_base_url", &self.public_base_url)
@@ -170,6 +172,7 @@ impl ServerConfig {
                     DEFAULT_BODY_READ_TIMEOUT_MS,
                 )?),
             },
+            database_key_file: env::var_os("LQS_DATABASE_KEY_FILE").map(PathBuf::from),
             bind_addr,
             database_path,
             public_base_url,
@@ -234,6 +237,7 @@ mod server_config_tests {
             bearer_credential: None,
             auth_principal: None,
             http_limits: HttpLimits::default(),
+            database_key_file: None,
             bind_addr: address.parse().unwrap(),
             database_path: PathBuf::from("lqs.sqlite"),
             public_base_url: "http://localhost".into(),
@@ -380,6 +384,7 @@ impl From<std::io::Error> for ServerError {
 #[derive(Clone)]
 struct AppState {
     admission: Arc<Admission>,
+    storage_encryption: crate::StorageEncryption,
     authorization_hook: Arc<AuthorizationHook>,
     access: Option<security_http::AccessContext>,
     lqs: Arc<Mutex<Lqs>>,
@@ -464,7 +469,12 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         (Some(credential), Some(principal)) => security_http::bearer_hook(credential, principal),
         _ => security_http::local_hook(config.trust_principal_header),
     };
-    let lqs = Lqs::open(&config.database_path)?;
+    let lqs = if let Some(path) = &config.database_key_file {
+        let key = crate::read_database_key_file(path)?;
+        Lqs::open_encrypted(&config.database_path, &key)?
+    } else {
+        Lqs::open(&config.database_path)?
+    };
     let listener = TcpListener::bind(config.bind_addr).await?;
     axum::serve(
         listener,
@@ -520,6 +530,7 @@ pub fn router_with_authorization_and_limits(
     limits.validate().expect("valid HTTP limits");
     let state = AppState {
         admission: Arc::new(Admission::new(limits)),
+        storage_encryption: lqs.storage_encryption(),
         authorization_hook,
         access: None,
         lqs: Arc::new(Mutex::new(lqs)),
@@ -528,6 +539,7 @@ pub fn router_with_authorization_and_limits(
     };
     Router::new()
         .route("/health", get(handle_health))
+        .route("/status", get(handle_status))
         .fallback(handle_request)
         .with_state(state)
 }
@@ -538,6 +550,19 @@ async fn handle_health(State(state): State<AppState>) -> StatusCode {
         Err(AdmissionError::Busy) => StatusCode::SERVICE_UNAVAILABLE,
         Err(AdmissionError::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
     }
+}
+
+async fn handle_status(State(state): State<AppState>) -> Response {
+    let _permit = match state.admission.try_enter() {
+        Ok(permit) => permit,
+        Err(AdmissionError::Busy) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(AdmissionError::RateLimited) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    axum::Json(json!({
+        "storageEncryption": state.storage_encryption.as_str(),
+        "sqsEncryptionSettings": "simulation",
+    }))
+    .into_response()
 }
 
 async fn handle_request(State(mut state): State<AppState>, request: Request) -> Response {
