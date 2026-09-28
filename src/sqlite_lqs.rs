@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::message_attributes::validate_message_attributes;
 use crate::{MessageAttributes, message_attributes_md5, message_attributes_size};
 use crate::{QueueSecurity, RequestIdentity, SecurityUpdate};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 #[path = "security_sqlite.rs"]
@@ -404,20 +404,22 @@ pub fn migrate_plaintext_database(
 ) -> Result<(), LqsError> {
     let source = source.as_ref();
     let target = target.as_ref();
-    if fs::symlink_metadata(target).is_ok() {
-        return Err(LqsError::Database(
-            "encrypted migration target must not exist".into(),
-        ));
-    }
     let source_path = source
         .to_str()
         .ok_or_else(|| LqsError::Database("database path must be UTF-8".into()))?;
-    let source_connection = Connection::open(source)?;
+    let source_connection = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     source_connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
         row.get::<_, i64>(0)
     })?;
     source_connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     drop(source_connection);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(target)
+        .map_err(|error| LqsError::Database(error.to_string()))?;
     let connection = open_keyed_connection(target, key)?;
     connection.execute("ATTACH DATABASE ?1 AS plaintext KEY ''", [source_path])?;
     connection.query_row("SELECT sqlcipher_export('main', 'plaintext')", [], |row| {

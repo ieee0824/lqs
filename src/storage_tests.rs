@@ -1,15 +1,19 @@
 use super::*;
 use crate::{MessageAttribute, MessageAttributeValue};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tower::ServiceExt;
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn paths() -> (std::path::PathBuf, std::path::PathBuf) {
     let directory = std::env::temp_dir().join(format!(
-        "lqs-encryption-{}-{}",
+        "lqs-encryption-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&directory).unwrap();
     (directory.join("messages.sqlite"), directory)
@@ -105,6 +109,20 @@ fn offline_migration_copies_plaintext_to_new_encrypted_database() {
     assert_eq!(encrypted.receive("q", 1, 2).unwrap()[0].body, marker);
     assert!(migrate_plaintext_database(&source, &target, &[b'k'; 32]).is_err());
     drop(encrypted);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn migration_does_not_create_a_missing_source_or_overwrite_target() {
+    let (source, directory) = paths();
+    let target = directory.join("encrypted.sqlite");
+    assert!(migrate_plaintext_database(&source, &target, &[b'k'; 32]).is_err());
+    assert!(!source.exists());
+    assert!(!target.exists());
+    fs::write(&target, b"keep").unwrap();
+    let original = fs::read(&target).unwrap();
+    assert!(migrate_plaintext_database(&source, &target, &[b'k'; 32]).is_err());
+    assert_eq!(fs::read(&target).unwrap(), original);
     fs::remove_dir_all(directory).unwrap();
 }
 
