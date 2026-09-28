@@ -1,7 +1,29 @@
-use lqs::{ServerConfig, serve};
+use lqs::{ServerConfig, migrate_plaintext_database, read_database_key_file, serve};
 
 #[tokio::main]
 async fn main() {
+    let mut args = std::env::args_os();
+    args.next();
+    if let Some(command) = args.next() {
+        if command != "migrate-plaintext" {
+            eprintln!("usage: lqs migrate-plaintext <source-db> <target-db> <key-file>");
+            std::process::exit(2);
+        }
+        let (Some(source), Some(target), Some(key_file), None) =
+            (args.next(), args.next(), args.next(), args.next())
+        else {
+            eprintln!("usage: lqs migrate-plaintext <source-db> <target-db> <key-file>");
+            std::process::exit(2);
+        };
+        let result = read_database_key_file(key_file)
+            .and_then(|key| migrate_plaintext_database(source, target, &key));
+        if let Err(error) = result {
+            eprintln!("database migration failed: {error}");
+            std::process::exit(1);
+        }
+        println!("encrypted database created; plaintext source remains in place");
+        return;
+    }
     let config = match ServerConfig::from_env() {
         Ok(config) => config,
         Err(error) => {
@@ -23,7 +45,13 @@ async fn main() {
     if config.allow_unauthenticated_remote && config.bearer_credential.is_none() {
         eprintln!("WARNING: accepting unauthenticated requests on a non-loopback interface.");
     }
-    eprintln!("SSE/KMS settings are configuration-only; SQLite payloads remain plaintext.");
+    if config.database_key_file.is_some() {
+        eprintln!(
+            "SQLCipher storage encryption enabled; SQS SSE/KMS settings remain simulation-only."
+        );
+    } else {
+        eprintln!("SSE/KMS settings are configuration-only; SQLite payloads remain plaintext.");
+    }
     if let Err(error) = serve(config).await {
         eprintln!("LQS server failed: {error}");
         std::process::exit(1);

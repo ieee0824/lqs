@@ -2,7 +2,7 @@
 
 開発・テスト用の SQLite ベース SQS シミュレーターです。Standard / FIFO キューをサポートし、AWS SDK から SQS 互換 HTTP API に接続するか、Rust ライブラリとして利用できます。キュー設定・メッセージ・FIFO 重複排除などの状態は SQLite に永続化します。
 
-> ローカル開発専用です。AWS 署名の検証や実データの暗号化は行いません。信頼できないクライアントやインターネットへ公開しないでください。
+> 開発・テスト用途です。AWS 署名の検証は行いません。保存時暗号化は鍵ファイルを指定した場合だけ有効です。外部公開時は認証と TLS を構成してください。
 
 [クイックスタート](#quickstart) · [設定](#configuration) · [対応機能](#features) · [Rust ライブラリ](#rust) · [制約](#limitations) · [テスト](#tests)
 
@@ -61,6 +61,7 @@ SDK の SQS クライアントに以下を設定してください。JSON / SQS 
 | `LQS_BIND_ADDR` | `127.0.0.1:9324` | 待ち受けアドレス |
 | `LQS_BASE_URL` | `http://` + 待ち受けアドレス | Queue URL に使用する公開 URL |
 | `LQS_DATABASE_PATH` | `lqs.sqlite` | SQLite ファイル |
+| `LQS_DATABASE_KEY_FILE` | 未設定 | 32〜128バイトの鍵ファイル。設定すると SQLCipher で保存時暗号化 |
 | `LQS_TRUST_PRINCIPAL_HEADER` | `false` | `true` の場合、権限テスト用の `x-lqs-principal` を受け付ける |
 | `LQS_AUTH_TOKEN` | 未設定 | HTTP Bearer 認証用のトークン（32文字以上の空白を含まない印字可能 ASCII） |
 | `LQS_AUTH_PRINCIPAL` | 未設定 | Bearer 認証済みリクエストに割り当てるアカウント ID または IAM ARN |
@@ -70,6 +71,25 @@ SDK の SQS クライアントに以下を設定してください。JSON / SQS 
 | `LQS_BODY_READ_TIMEOUT_MS` | `5000` | 本文の読み取りに許す時間（ミリ秒） |
 
 既定の認証なしモードは loopback でのみ起動します。外部向けに待ち受ける場合は `LQS_AUTH_TOKEN` と `LQS_AUTH_PRINCIPAL` を両方指定するか、危険性を理解したうえで `LQS_ALLOW_UNAUTHENTICATED_REMOTE=true` を指定します。Bearer モードではすべての SQS 操作に `Authorization: Bearer <token>` が必要です。トークンは安全な乱数で生成し、TLS 終端などで通信とトークンを保護してください。`x-lqs-principal` はクライアントの自己申告であり、認証ではありません。`LQS_TRUST_PRINCIPAL_HEADER=true` は loopback での権限テストに限定し、Bearer モードと併用できません。詳細は [呼び出し元の識別・ポリシー](docs/compatibility.md#security) を参照してください。
+
+### 保存時暗号化と既存 DB の移行
+
+暗号化を有効にするには、32バイトのランダムな鍵を所有者だけが読めるファイルへ保存し、起動時に渡します。鍵の内容はログやコマンド引数へ出しません。
+
+```bash
+umask 077
+openssl rand 32 > lqs.key
+LQS_DATABASE_KEY_FILE=lqs.key cargo run --locked
+```
+
+既存の平文 DB を暗号化する場合は、サーバーを停止してから別の新規ファイルへ移行します。移行元とそのバックアップは平文のまま残るため、移行後の動作確認まで保護し、不要になった時点で適切に廃棄してください。
+
+```bash
+cargo run --locked -- migrate-plaintext old.sqlite encrypted.sqlite lqs.key
+LQS_DATABASE_PATH=encrypted.sqlite LQS_DATABASE_KEY_FILE=lqs.key cargo run --locked
+```
+
+`GET /status` の `storageEncryption` は `none` または `sqlcipher` を返します。`sqsEncryptionSettings` は常に `simulation` であり、SQS の SSE/KMS 属性は実際の鍵管理や KMS 呼び出しを意味しません。保護範囲、バックアップ、鍵の扱いは [互換仕様](docs/compatibility.md#security) を参照してください。
 
 <a id="features"></a>
 
@@ -138,7 +158,7 @@ Rust の直接操作は信頼された管理用 API で、HTTP の認可を自�
 
 - AWS SQS の完全な代替ではありません。リージョンは `us-east-1`、アカウントは `000000000000` 固定です。分散処理、リージョン別 TPS、非同期の設定反映・近似メトリクス更新は再現しません。
 - Policy 未設定のキューはローカル開放モードです。設定済みの場合は明示的 Allow が必要で、Deny が優先します。`Policy=""` で解除すると再び開放されます。
-- SSE-SQS / KMS は設定モデルのみです。本文・属性・SQLite / WAL・バックアップは平文のままです。TLS、SigV4 認証、CloudTrail 相当の監査ログも提供しません。
+- SSE-SQS / KMS は設定モデルのみです。鍵ファイルを指定した SQLCipher モードでは SQLite / WAL 内の本文・属性・FIFO 受信キャッシュを暗号化します。平文モードと平文の移行元・バックアップは保護されません。TLS、SigV4 認証、CloudTrail 相当の監査ログも提供しません。
 - HTTP の非同期 DLQ move-task API、`RedriveAllowPolicy`、ポリシーの `Condition` / `Not*`、`AWSTraceHeader` 送信、メッセージ属性のリスト値は未対応です。
 - バッチは HTTP 200 でも部分失敗があります。必ず `Failed` を確認してください。パージ・削除したメッセージは復元できません。
 

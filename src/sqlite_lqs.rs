@@ -1,10 +1,13 @@
 use std::fmt;
+use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use crate::message_attributes::validate_message_attributes;
 use crate::{MessageAttributes, message_attributes_md5, message_attributes_size};
 use crate::{QueueSecurity, RequestIdentity, SecurityUpdate};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 #[path = "security_sqlite.rs"]
@@ -50,6 +53,10 @@ mod attribute_tests;
 #[cfg(test)]
 #[path = "fifo_tests.rs"]
 mod fifo_tests;
+
+#[cfg(test)]
+#[path = "storage_tests.rs"]
+mod storage_tests;
 
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 120_000;
@@ -282,12 +289,163 @@ impl From<rusqlite::Error> for LqsError {
 /// SQLite-backed LQS repository. A connection owns one database session.
 pub struct Lqs {
     connection: Connection,
+    storage_encryption: StorageEncryption,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageEncryption {
+    None,
+    SqlCipher,
+}
+
+impl StorageEncryption {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SqlCipher => "sqlcipher",
+        }
+    }
+}
+
+fn ensure_private_database_file(path: &Path) -> Result<(), LqsError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| LqsError::Database(error.to_string()))?;
+            if !metadata.is_file() {
+                return Err(LqsError::Database(
+                    "encrypted database path must be a regular file".into(),
+                ));
+            }
+            #[cfg(unix)]
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(LqsError::Database(
+                    "encrypted database file must have owner-only permissions".into(),
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => Err(LqsError::Database(error.to_string())),
+    }
+}
+
+pub fn read_database_key_file(path: impl AsRef<Path>) -> Result<Vec<u8>, LqsError> {
+    let path = path.as_ref();
+    let metadata = fs::metadata(path).map_err(|error| LqsError::Database(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(LqsError::Database(
+            "SQLCipher key path must be a regular file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(LqsError::Database(
+            "SQLCipher key file must have owner-only permissions".into(),
+        ));
+    }
+    let key = fs::read(path).map_err(|error| LqsError::Database(error.to_string()))?;
+    if !(32..=128).contains(&key.len()) {
+        return Err(LqsError::Database(
+            "SQLCipher key must contain 32 to 128 bytes".into(),
+        ));
+    }
+    Ok(key)
+}
+
+fn open_keyed_connection(path: &Path, key: &[u8]) -> Result<Connection, LqsError> {
+    if !(32..=128).contains(&key.len()) {
+        return Err(LqsError::Database(
+            "SQLCipher key must contain 32 to 128 bytes".into(),
+        ));
+    }
+    ensure_private_database_file(path)?;
+    let connection = Connection::open(path)?;
+    let version: String = connection
+        .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+        .map_err(|_| LqsError::Database("SQLCipher support is unavailable".into()))?;
+    if version.is_empty() {
+        return Err(LqsError::Database(
+            "SQLCipher support is unavailable".into(),
+        ));
+    }
+    // SAFETY: the connection handle remains valid and SQLCipher copies the key during this call.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_key(
+            connection.handle(),
+            key.as_ptr().cast(),
+            i32::try_from(key.len()).expect("validated key length"),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK {
+        return Err(LqsError::Database(
+            "failed to configure SQLCipher key".into(),
+        ));
+    }
+    connection
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|_| LqsError::Database("failed to unlock encrypted database".into()))?;
+    connection.execute_batch("PRAGMA temp_store=MEMORY;")?;
+    Ok(connection)
+}
+
+/// Copies a stopped plaintext database to a new encrypted file. The source is retained.
+/// Keep the source and any backups protected until they can be securely retired.
+pub fn migrate_plaintext_database(
+    source: impl AsRef<Path>,
+    target: impl AsRef<Path>,
+    key: &[u8],
+) -> Result<(), LqsError> {
+    let source = source.as_ref();
+    let target = target.as_ref();
+    let source_path = source
+        .to_str()
+        .ok_or_else(|| LqsError::Database("database path must be UTF-8".into()))?;
+    let source_connection = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    source_connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    source_connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    drop(source_connection);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(target)
+        .map_err(|error| LqsError::Database(error.to_string()))?;
+    let connection = open_keyed_connection(target, key)?;
+    connection.execute("ATTACH DATABASE ?1 AS plaintext KEY ''", [source_path])?;
+    connection.query_row("SELECT sqlcipher_export('main', 'plaintext')", [], |row| {
+        row.get::<_, Option<String>>(0)
+    })?;
+    connection.execute_batch("DETACH DATABASE plaintext;")?;
+    drop(connection);
+    let _ = Lqs::open_encrypted(target, key)?;
+    Ok(())
 }
 
 impl Lqs {
     /// Opens (and migrates) a persistent SQLite database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LqsError> {
         Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Opens a SQLCipher database. The key is a raw secret supplied by the caller.
+    /// Existing plaintext databases are not converted automatically.
+    pub fn open_encrypted(path: impl AsRef<Path>, key: &[u8]) -> Result<Self, LqsError> {
+        let connection = open_keyed_connection(path.as_ref(), key)?;
+        Self::from_connection_with_encryption(connection, StorageEncryption::SqlCipher)
+    }
+
+    pub fn storage_encryption(&self) -> StorageEncryption {
+        self.storage_encryption
     }
 
     /// Creates an isolated SQLite in-memory database, primarily useful for tests.
@@ -300,10 +458,20 @@ impl Lqs {
         Self::in_memory().expect("opening an in-memory SQLite database must succeed")
     }
 
-    fn from_connection(mut connection: Connection) -> Result<Self, LqsError> {
+    fn from_connection(connection: Connection) -> Result<Self, LqsError> {
+        Self::from_connection_with_encryption(connection, StorageEncryption::None)
+    }
+
+    fn from_connection_with_encryption(
+        mut connection: Connection,
+        storage_encryption: StorageEncryption,
+    ) -> Result<Self, LqsError> {
         create_base_schema(&connection)?;
         migrate_existing_schema(&mut connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            storage_encryption,
+        })
     }
 
     pub fn create_queue(
